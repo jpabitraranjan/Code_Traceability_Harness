@@ -1,0 +1,12 @@
+# Core runtime
+tree-sitter>=0.22
+tree-sitter-python>=0.21
+networkx>=3.0
+pyyaml>=6.0
+
+# Code-quality signals (optional: tracegraph index --ruff / --pyright)
+ruff
+pyright
+
+# Tests (optional)
+pytest
