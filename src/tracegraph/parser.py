@@ -38,14 +38,24 @@ class Import:
 
 
 @dataclass
+class Route:
+    caller: str   # scope the route is declared in
+    view: str     # dotted reference to the view, `.as_view()` / wrappers stripped
+    route: str    # url pattern string
+    line: int
+
+
+@dataclass
 class Parsed:
     symbols: list = field(default_factory=list)
     calls: list = field(default_factory=list)
     imports: list = field(default_factory=list)
+    routes: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {k: [asdict(x) for x in v] for k, v in
-                (("symbols", self.symbols), ("calls", self.calls), ("imports", self.imports))}
+                (("symbols", self.symbols), ("calls", self.calls), ("imports", self.imports),
+                 ("routes", self.routes))}
 
 
 def parse(src: bytes) -> Parsed:
@@ -62,10 +72,45 @@ def parse(src: bytes) -> Parsed:
         if n.type == "identifier":
             return t(n)
         if n.type == "attribute":
-            obj = dotted(n.child_by_field_name("object"))
+            on = n.child_by_field_name("object")
             attr = t(n.child_by_field_name("attribute"))
+            if on is not None and on.type == "call":  # super().method() -> "super.method"
+                fn = on.child_by_field_name("function")
+                if fn is not None and fn.type == "identifier" and t(fn) == "super":
+                    return f"super.{attr}"
+            obj = dotted(on)
             return f"{obj}.{attr}" if obj else f"?.{attr}"
         return None
+
+    def unwrap_view(n):
+        if n is None:
+            return None
+        if n.type in ("identifier", "attribute"):
+            return dotted(n)
+        if n.type == "call":
+            fd = dotted(n.child_by_field_name("function"))
+            if fd == "include":
+                return None
+            if fd and fd.endswith(".as_view"):
+                return fd[:-len(".as_view")]
+            args = n.child_by_field_name("arguments")  # wrappers such as login_required(view)
+            if args is not None:
+                for a in args.named_children:
+                    if a.type != "keyword_argument":
+                        return unwrap_view(a)
+        return None
+
+    def maybe_route(node, d, caller):
+        tail = d.rsplit(".", 1)[-1]
+        if tail not in ("path", "re_path", "url", "register") or (tail == "register" and "router" not in d.lower()):
+            return
+        args = node.child_by_field_name("arguments")
+        pos = [a for a in args.named_children if a.type != "keyword_argument"] if args is not None else []
+        if len(pos) < 2 or pos[0].type != "string":
+            return
+        view = unwrap_view(pos[1])
+        if view:
+            out.routes.append(Route(caller, view, t(pos[0]).lstrip("rRbBfFuU").strip("'\""), node.start_point[0] + 1))
 
     def add_import(alias, module, name, level, line):
         out.imports.append(Import(alias, module, name, level, line))
@@ -137,6 +182,7 @@ def parse(src: bytes) -> Parsed:
                 d = dotted(node.child_by_field_name("function"))
                 if d:
                     out.calls.append(Call(caller, d, node.start_point[0] + 1))
+                    maybe_route(node, d, caller)
             for c in node.children:
                 visit(c, scope, caller)
 

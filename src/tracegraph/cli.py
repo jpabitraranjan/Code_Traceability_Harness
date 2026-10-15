@@ -19,7 +19,9 @@ def _loc(x) -> str:
 
 
 def cmd_index(a):
-    stats = index_repo(a.repo, _db(a), requirements=a.requirements,
+    req = a.requirements or next((str(Path(a.repo) / f) for f in ("requirements.yaml", "requirements.yml")
+                                  if (Path(a.repo) / f).exists()), None)
+    stats = index_repo(a.repo, _db(a), requirements=req,
                        quality=[t for t in ("ruff", "pyright") if getattr(a, t)] or None)
     print(json.dumps(stats) if a.json else "  ".join(f"{k}={v}" for k, v in stats.items()))
 
@@ -86,6 +88,10 @@ def cmd_show(a):
 
 def cmd_requirements(a):
     rows = rq.report(connect(_db(a)))
+    if not rows and not a.json:
+        print("No requirements loaded. Create requirements.yaml (see README) and run:\n"
+              "  tracegraph index --repo <repo> --requirements requirements.yaml")
+        return
     if a.json:
         print(json.dumps(rows, indent=2))
         return
@@ -94,6 +100,24 @@ def cmd_requirements(a):
               f"tests={len(r['tests_reaching']):<3} {r['title']}")
         for p in r["unmatched_patterns"]:
             print(f"    ! no code matches: {p}")
+
+
+def cmd_find(a):
+    conn = connect(_db(a))
+    rows = conn.execute("""SELECT id, kind, start_line, end_line, is_test FROM nodes
+        WHERE kind IN ('class','function','method','module','route') AND (name=? OR id LIKE ?)
+        ORDER BY (name=?) DESC, length(id) LIMIT ?""", (a.query, f"%{a.query}%", a.query, a.limit)).fetchall()
+    if a.json:
+        print(json.dumps([dict(r) for r in rows], indent=2))
+    for r in ([] if a.json else rows):
+        print(f"{r['id']}  [{r['kind']}] L{r['start_line']}-{r['end_line']}" + ("  (test)" if r["is_test"] else ""))
+    if not rows and not a.json:
+        print("no matches")
+
+
+def cmd_ui(a):
+    from .server import serve
+    serve(a.repo, a.db, a.requirements, port=a.port, open_browser=not a.no_browser)
 
 
 def cmd_export(a):
@@ -125,6 +149,11 @@ def main(argv=None):
     p.add_argument("target")
     add("requirements", cmd_requirements, "requirement status and coverage")
     p = add("export", cmd_export, "dump the graph as JSON"); p.add_argument("--out")
+    p = add("find", cmd_find, "search symbols by name or id fragment")
+    p.add_argument("query"); p.add_argument("--limit", type=int, default=20)
+    p = add("ui", cmd_ui, "start the local web UI (views: requirements, traceability, change impact)")
+    p.add_argument("--port", type=int, default=8765); p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--requirements", help="requirements.yaml (auto-detected in the repo root)")
     a = ap.parse_args(argv)
     a.fn(a)
 

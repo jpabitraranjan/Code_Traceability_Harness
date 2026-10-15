@@ -10,3 +10,6 @@ pyright
 
 # Tests (optional)
 pytest
+
+# MCP server (tracegraph-mcp); works with mcp 1.x and 2.x
+mcp>=1.2

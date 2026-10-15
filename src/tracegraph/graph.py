@@ -11,10 +11,11 @@ import networkx as nx
 
 from .parser import Symbol, parse
 
-PARSER_VERSION = "1"
+PARSER_VERSION = "2"
 SKIP_DIRS = {".git", ".hg", ".venv", "venv", "env", "node_modules", "__pycache__", "build", "dist",
              "site-packages", ".tox", ".mypy_cache", ".ruff_cache", ".tracegraph", ".pytest_cache"}
 MAX_BYTES = 1_000_000
+SKIP_PATH_PARTS = {"migrations"}
 CALL_KINDS = ("calls", "inherits")
 
 SCHEMA = """
@@ -48,13 +49,24 @@ def scan_files(repo: Path):
         for f in sorted(files):
             if f.endswith(".py"):
                 p = Path(root) / f
+                rel = p.relative_to(repo).as_posix()
+                if SKIP_PATH_PARTS & set(rel.split("/")[:-1]):
+                    continue
                 if p.stat().st_size <= MAX_BYTES:
-                    yield p.relative_to(repo).as_posix(), p
+                    yield rel, p
 
 
 def is_test_file(path: str) -> bool:
-    b = path.rsplit("/", 1)[-1]
-    return b.startswith("test_") or b.endswith("_test.py")
+    parts = path.split("/")
+    b = parts[-1]
+    if b in ("__init__.py", "conftest.py"):
+        return False
+    return b.startswith("test") or b.endswith("_test.py") or "tests" in parts[:-1] or "test" in parts[:-1]
+
+
+def is_test_class(s) -> bool:
+    return s.kind == "class" and (s.name.startswith("Test") or any(
+        b.rsplit(".", 1)[-1].endswith(("TestCase", "Test")) for b in s.bases))
 
 
 def module_dotted(path: str) -> str:
@@ -204,15 +216,40 @@ class Resolver:
             return [(x, "heuristic", 0.25) for x in c]
         return []
 
-    def resolve(self, path, scope, dotted):
+    def member_or_ext(self, path, cls, name, depth=0, skip_self=False):
+        """Find `name` on cls or its bases; (id, is_external) or None. External bases yield ext::<base>.<name>."""
+        if not skip_self and f"{cls}.{name}" in self.syms[path]:
+            return nid(path, f"{cls}.{name}"), False
+        if depth > 5:
+            return None
+        sym = self.syms[path][cls]
+        for base in sym.bases:
+            for tid, _, _ in self.resolve(path, sym.parent, base, fallback=False):
+                if tid.startswith("ext::"):
+                    return f"{tid}.{name}", True
+                p, qq = tid.split("::", 1)
+                if self.syms[p][qq].kind == "class":
+                    r = self.member_or_ext(p, qq, name, depth + 1)
+                    if r:
+                        return r
+                    break
+        return None
+
+    def resolve(self, path, scope, dotted, fallback=True):
         parts = dotted.split(".")
         head = parts[0]
-        if head in ("self", "cls") and len(parts) >= 2:
+        if head in ("self", "cls", "super") and len(parts) >= 2:
             cls = self.enclosing_class(path, scope)
-            if cls:
-                m = self.class_member(path, cls, parts[1])
-                if m:
-                    return [(m, "static", 0.9)]
+            if cls and (len(parts) == 2):
+                r = self.member_or_ext(path, cls, parts[1], skip_self=(head == "super"))
+                if r:
+                    mid, is_ext = r
+                    if not is_ext:
+                        return [(mid, "static", 0.9)]
+                    self.externals.add(mid[5:])
+                    return [(mid, "static", 0.9)] if head == "super" else [(mid, "heuristic", 0.6)]
+            if head == "super" or not fallback:
+                return []
             return self.fallback(parts[-1])
         sc = scope.split(".") if scope and scope != "<module>" else []
         for i in range(len(sc), -1, -1):
@@ -227,7 +264,7 @@ class Resolver:
             a = ".".join(parts[:k])
             if a in amap:
                 return self.follow(amap[a], parts[k:])
-        if len(parts) >= 2:
+        if len(parts) >= 2 and fallback:
             return self.fallback(parts[-1])
         return []
 
@@ -238,7 +275,8 @@ def _load_files(conn) -> dict[str, dict]:
     for r in conn.execute("SELECT path, parsed FROM files ORDER BY path"):
         d = json.loads(r["parsed"])
         d["symbols"] = [Symbol(**s) for s in d["symbols"]]
-        from .parser import Call, Import
+        from .parser import Call, Import, Route
+        d["routes"] = [Route(**r) for r in d.get("routes", [])]
         d["calls"] = [Call(**c) for c in d["calls"]]
         d["imports"] = [Import(**i) for i in d["imports"]]
         files[r["path"]] = d
@@ -256,11 +294,12 @@ def build_graph(conn) -> dict:
         nodes[nid(path, "<module>")] = (nid(path, "<module>"), "module", path.rsplit("/", 1)[-1], path,
                                         1, f["lines"], int(test_file), "{}")
         for s in f["symbols"]:
-            parent_kind = R.syms[path][s.parent].kind if s.parent else "module"
-            is_test = int(test_file and s.name.startswith(("test", "Test")) and (
-                (s.kind == "function" and not s.parent) or
-                (s.kind == "method" and parent_kind == "class" and s.parent.split(".")[-1].startswith("Test")) or
-                (s.kind == "class" and not s.parent and s.name.startswith("Test"))))
+            par = R.syms[path].get(s.parent) if s.parent else None
+            is_test = int(test_file and (
+                (s.kind == "function" and not s.parent and s.name.startswith("test")) or
+                (s.kind == "method" and par is not None and not par.parent and is_test_class(par)
+                 and s.name.startswith("test")) or
+                (s.kind == "class" and not s.parent and is_test_class(s))))
             attrs = json.dumps({"decorators": s.decorators} if s.decorators else {})
             nodes[nid(path, s.qualname)] = (nid(path, s.qualname), s.kind, s.name, path, s.start, s.end, is_test, attrs)
             edges.add((nid(path, s.parent or "<module>"), nid(path, s.qualname), "contains", "static", 1.0, s.start))
@@ -278,10 +317,19 @@ def build_graph(conn) -> dict:
                 tf = tf or sub
             if tf and tf != path:
                 edges.add((nid(path, "<module>"), nid(tf, "<module>"), "imports", "static", 1.0, imp.line))
+        for r in f["routes"]:  # Django-style url routes: route node --dispatches to--> view
+            rid = nid(path, f"route:{r.route or '/'}@{r.line}")
+            nodes[rid] = (rid, "route", "/" + r.route.lstrip("/"), path, r.line, r.line, 0, "{}")
+            edges.add((nid(path, "<module>"), rid, "contains", "static", 1.0, r.line))
+            for tid, prov, conf in R.resolve(path, r.caller, r.view, fallback=False):
+                if not tid.startswith("ext::") and R.syms[tid.split("::", 1)[0]][tid.split("::", 1)[1]].kind in (
+                        "function", "class", "method"):
+                    edges.add((rid, tid, "calls", prov, conf, r.line))
+                    break
         for c in f["calls"]:
             for tid, prov, conf in R.resolve(path, c.caller, c.callee):
                 src = nid(path, c.caller)
-                if tid != src or prov != "static":  # keep real recursion, drop heuristic self-loops
+                if tid != src or prov == "static":  # keep real recursion, drop heuristic self-loops
                     edges.add((src, tid, "calls", prov, conf, c.line))
 
     for e in R.externals | {t for (_, t, *_r) in edges if t.startswith("ext::")}:
@@ -298,6 +346,7 @@ def build_graph(conn) -> dict:
     conn.commit()
     ncalls = sum(1 for e in edges if e[2] == "calls")
     return {"files": len(files), "nodes": len(nodes), "edges": len(edges), "calls": ncalls,
+            "routes": sum(1 for n in nodes.values() if n[1] == "route"),
             "heuristic_calls": sum(1 for e in edges if e[2] == "calls" and e[3] == "heuristic")}
 
 

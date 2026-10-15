@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tracegraph</title>
+<style>
+:root{--bg:#fff;--fg:#1d2330;--mut:#667085;--line:#e3e6ec;--card:#f6f7f9;--acc:#3b5bdb;--red:#e03131;--org:#f08c00;--grn:#2f9e44;--blu:#1c7ed6}
+@media(prefers-color-scheme:dark){:root{--bg:#14171f;--fg:#e6e9f0;--mut:#98a2b3;--line:#2a2f3a;--card:#1b1f29;--acc:#8ea2ff}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid var(--line)}
+header b{font-size:15px}input,select,button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:5px 9px}
+button{cursor:pointer}button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+#repo{width:260px}#req{width:150px}
+#stat{padding:6px 14px;color:var(--mut);font-size:12px;border-bottom:1px solid var(--line)}
+nav{display:flex;gap:2px;padding:0 14px;border-bottom:1px solid var(--line)}
+nav button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:9px 12px}
+nav button.on{border-color:var(--acc);color:var(--acc);font-weight:600}
+main{padding:14px;max-width:1500px}section{display:none}section.on{display:block}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500;font-size:12px}tr.row{cursor:pointer}tr.row:hover{background:var(--card)}
+.b{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:var(--card);border:1px solid var(--line)}
+.ok{color:var(--grn)}.warn{color:var(--org)}.bad{color:var(--red)}.mut{color:var(--mut)}
+a.s{color:var(--acc);cursor:pointer;word-break:break-all}a.s:hover{text-decoration:underline}
+details{margin:4px 0 4px 14px}summary{cursor:pointer;padding:2px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1.2fr);gap:14px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+#cy{height:460px;border:1px solid var(--line);border-radius:8px}
+#drawer{position:fixed;top:0;right:0;width:min(560px,96vw);height:100%;background:var(--bg);border-left:1px solid var(--line);
+ box-shadow:-6px 0 20px #0003;padding:14px;overflow:auto;display:none;z-index:5}
+pre{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:8px;overflow:auto;font-size:12px;max-height:340px}
+.chip{display:inline-block;margin:2px 4px 2px 0}.row2{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+h3{margin:14px 0 6px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+</style></head><body>
+<header>
+ <b>tracegraph</b>
+ <input id="repo" placeholder="local repo folder"><button id="open">Open</button>
+ <input id="req" placeholder="requirements.yaml"><label><input type="checkbox" id="ruff"> Ruff</label>
+ <button class="p" id="index">Index</button><span id="msg" class="mut"></span>
+</header>
+<div id="stat"></div>
+<nav><button data-t="a" class="on">A · Requirements</button><button data-t="b">B · Traceability</button><button data-t="c">C · Change impact</button></nav>
+<main>
+<section id="a" class="on">
+ <div class="row2"><input id="q" placeholder="search requirements"><select id="st"><option value="">any status</option><option>planned</option><option>partial</option><option>implemented</option></select></div>
+ <table><thead><tr><th>ID</th><th>Title</th><th>Status</th><th>Code</th><th>Tests</th><th>Coverage</th></tr></thead><tbody id="reqs"></tbody></table>
+ <p id="noreq" class="mut" style="display:none">No requirements loaded. Put a requirements.yaml in the repo (see README), enter its path above and press Index.</p>
+</section>
+<section id="b"><p class="mut">Pick a requirement in view A.</p><div id="trace"></div></section>
+<section id="c">
+ <div class="row2">
+  <button id="diff">Load git diff</button><input id="base" value="HEAD" size="8" title="git base ref">
+  <input id="sq" placeholder="add a symbol by name"><button id="sbtn">Search</button>
+  <label>depth <input id="depth" type="number" value="6" min="1" max="20" style="width:60px"></label>
+  <button class="p" id="go">Analyze impact</button>
+ </div>
+ <div id="found"></div><div id="picked" class="row2"></div>
+ <div class="grid"><div id="res"></div><div><div id="cy"></div><div id="legend" class="mut" style="font-size:12px;margin-top:6px"></div></div></div>
+</section>
+</main>
+<div id="drawer"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function api(p,body){const r=await fetch(p,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});const j=await r.json();if(j.error)throw new Error(j.error);return j}
+const msg=(t,bad)=>{$('#msg').textContent=t;$('#msg').className=bad?'bad':'mut'};
+const sym=id=>`<a class="s" data-sym="${esc(id)}">${esc(id)}</a>`;
+document.addEventListener('click',e=>{const a=e.target.closest('[data-sym]');if(a)openSym(a.dataset.sym)});
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>tab(b.dataset.t));
+function tab(t){document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t==t));document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id==t))}
+
+async function status(){try{const s=await api('/api/status');$('#repo').value=s.repo;if(!$('#req').value)$('#req').value=s.requirements_file;
+ const h=s.calls?Math.round(100*s.heuristic_calls/s.calls):0;
+ $('#stat').textContent=`${s.files} files · ${s.symbols} symbols · ${s.tests} tests · ${s.routes} routes · ${s.edges} edges (${h}% of calls heuristic) · ${s.requirements} requirements`+(s.diagnostics?` · ${s.diagnostics} lint findings`:'')}catch(e){msg(e.message,1)}}
+$('#index').onclick=async()=>{msg('indexing…');try{const r=await api('/api/index',{requirements:$('#req').value,ruff:$('#ruff').checked});msg(`done · ${r.stats.reparsed} files re-parsed`);await status();loadReqs()}catch(e){msg(e.message,1)}};
+$('#open').onclick=async()=>{msg('opening…');try{await api('/api/repo',{path:$('#repo').value,requirements:$('#req').value});$('#req').value='';picked.clear();msg('');await status();loadReqs();$('#res').innerHTML='';clearGraph()}catch(e){msg(e.message,1)}};
+
+// ---- View A
+async function loadReqs(){const r=await api(`/api/requirements?q=${encodeURIComponent($('#q').value)}&status=${$('#st').value}`);
+ $('#noreq').style.display=r.requirements.length||$('#q').value||$('#st').value?'none':'block';
+ const cc={tested:'ok','untested':'warn','no-code':'bad'};
+ $('#reqs').innerHTML=r.requirements.map(x=>`<tr class="row" data-req="${esc(x.id)}"><td><b>${esc(x.id)}</b></td><td>${esc(x.title)}${x.unmatched.length?`<div class="warn" style="font-size:12px">no code matches: ${esc(x.unmatched.join(', '))}</div>`:''}</td>
+ <td><span class="b">${esc(x.status)}</span></td><td>${x.implementations}</td><td>${x.tests}${x.declared_tests?` <span class="mut">(${x.declared_tests} declared)</span>`:''}</td><td class="${cc[x.coverage]}">${x.coverage}</td></tr>`).join('')}
+$('#reqs').onclick=e=>{const r=e.target.closest('[data-req]');if(r)openTrace(r.dataset.req)};
+$('#q').oninput=loadReqs;$('#st').onchange=loadReqs;
+
+// ---- View B
+async function openTrace(id){tab('b');$('#b>p').style.display='none';try{const t=await api('/api/trace?id='+encodeURIComponent(id));
+ const tests=t.declared_tests.map(x=>`<li>${esc(x)}</li>`).join('')||'<li class="mut">none declared</li>';
+ $('#trace').innerHTML=`<div class="card"><b>${esc(t.id)}</b> · ${esc(t.title)} <span class="b">${esc(t.status)}</span><div class="mut">${esc(t.description)}</div></div>
+ <details open><summary><b>Design decisions</b></summary><ul>${t.design.map(d=>`<li>${esc(d)}</li>`).join('')||'<li class="mut">none recorded</li>'}</ul></details>
+ <details open><summary><b>Implementation</b> (${t.implementations.length})</summary>${t.implementations.map(i=>`<details open><summary>${sym(i.id)} <span class="mut">${i.kind} L${i.lines}</span>${i.diagnostics?` <span class="warn">${i.diagnostics} lint</span>`:''}</summary>
+  <div class="mut" style="margin-left:14px">calls: ${i.calls.map(sym).join(', ')||'–'}${i.external_calls?` · ${i.external_calls} external`:''}</div>
+  <ul>${i.tests.map(x=>`<li>${esc(x.pytest_id)} <span class="mut">distance ${x.distance}</span>${x.declared?' <span class="ok">declared</span>':''}</li>`).join('')||'<li class="warn">no test reaches this code</li>'}</ul></details>`).join('')||'<p class="warn">No code linked.</p>'}</details>
+ <details open><summary><b>Declared verification</b></summary><ul>${tests}</ul></details>`}catch(e){$('#trace').innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
+
+// ---- Symbol drawer (line-level context)
+async function openSym(id){const d=$('#drawer');d.style.display='block';d.innerHTML='loading…';try{const s=await api('/api/symbol?id='+encodeURIComponent(id));
+ const edges=(l,t)=>l&&l.length?`<h3>${t}</h3>`+l.map(x=>x.truncated?`<div class="mut">+${x.truncated} more</div>`:`<div>${sym(x.id)} <span class="mut">${x.line?'L'+x.line:''}${x.heuristic?' · heuristic':''}</span></div>`).join(''):'';
+ d.innerHTML=`<button onclick="$('#drawer').style.display='none'" style="float:right">Close</button><b>${esc(s.symbol.id)}</b><div class="mut">${esc(s.symbol.kind)} · L${esc(s.symbol.lines)}${s.symbol.is_test?' · test':''}</div>
+ ${s.source?`<pre>${esc(s.source)}</pre>`:''}${edges(s.called_by,'Called by')}${edges(s.calls,'Calls')}
+ ${s.tests_reaching_this?`<h3>Tests reaching this</h3>`+s.tests_reaching_this.map(t=>`<div>${esc(t.pytest_id)} <span class="mut">d=${t.distance}</span></div>`).join(''):''}
+ ${s.requirements?`<h3>Requirements</h3>`+s.requirements.map(r=>`<div><a class="s" onclick="openTrace('${esc(r.id)}')">${esc(r.id)}</a> ${esc(r.title)} <span class="mut">${esc(r.relation)}</span></div>`).join(''):''}
+ ${s.diagnostics?`<h3>Findings</h3>`+s.diagnostics.map(x=>`<div class="warn">L${x.line} ${esc(x.code)} ${esc(x.message)}</div>`).join(''):''}`}catch(e){d.innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
+
+// ---- View C
+const picked=new Set();let useDiff=false,cy=null;
+function renderPicked(){$('#picked').innerHTML=[...picked].map(id=>`<span class="b chip">${esc(id.split('::').pop())} <a class="s" data-rm="${esc(id)}">×</a></span>`).join('')}
+$('#picked').onclick=e=>{const r=e.target.closest('[data-rm]');if(r){picked.delete(r.dataset.rm);renderPicked()}};
+$('#diff').onclick=async()=>{try{const r=await api('/api/changed?base='+encodeURIComponent($('#base').value));useDiff=true;
+ $('#found').innerHTML=r.changed.length?`<div class="card"><b>${r.changed.length} changed symbols</b> (vs ${esc($('#base').value)}) <span class="mut">— all included in the analysis</span><br>${r.changed.map(c=>`<div>${sym(c.id)} <span class="mut">lines ${c.changed_lines.join(', ')}</span></div>`).join('')}</div>`:'<p class="mut">No uncommitted changes to Python files.</p>'}catch(e){$('#found').innerHTML=`<p class="bad">${esc(e.message)}</p>`}};
+$('#sbtn').onclick=async()=>{const r=await api('/api/search?q='+encodeURIComponent($('#sq').value));
+ $('#found').innerHTML=r.matches.map(m=>`<span class="b chip"><a class="s" data-add="${esc(m.id)}">+ ${esc(m.id)}</a></span>`).join('')||'<p class="mut">no matches</p>'};
+$('#sq').onkeydown=e=>{if(e.key=='Enter')$('#sbtn').onclick()};
+$('#found').onclick=e=>{const a=e.target.closest('[data-add]');if(a){picked.add(a.dataset.add);renderPicked()}};
+$('#go').onclick=async()=>{$('#res').innerHTML='analyzing…';try{const r=await api('/api/impact',{targets:[...picked],use_diff:useDiff,base:$('#base').value,depth:+$('#depth').value});showImpact(r.result);drawGraph(r.graph)}catch(e){$('#res').innerHTML=`<p class="bad">${esc(e.message)}</p>`;clearGraph()}};
+function showImpact(r){const cmd=r.tests.length?'pytest '+r.tests.map(t=>t.pytest_id).join(' '):'';
+ $('#res').innerHTML=`<div class="card"><b>${r.changed.length}</b> changed → <b>${r.impacted.length}</b> affected · <b>${r.tests.length}</b> tests · <b>${r.requirements.length}</b> requirements</div>
+ ${cmd?`<h3>Tests to run</h3><pre id="cmd">${esc(cmd)}</pre><button onclick="navigator.clipboard.writeText($('#cmd').textContent)">Copy</button>`:''}
+ ${r.requirements.length?'<h3>Requirements affected</h3>'+r.requirements.map(q=>`<div><a class="s" onclick="openTrace('${esc(q.id)}')">${esc(q.id)}</a> ${esc(q.title)} <span class="mut">distance ${q.distance}</span></div>`).join(''):''}
+ <h3>Potentially affected</h3><table><thead><tr><th>d</th><th>symbol</th><th>conf</th></tr></thead><tbody>${r.impacted.map(i=>`<tr><td>${i.distance}</td><td>${sym(i.id)}<div class="mut" style="font-size:12px">${i.kind}${i.call_line?' · call at L'+i.call_line:''}</div></td><td class="${i.provenance=='static'?'':'warn'}">${i.confidence.toFixed(2)}${i.provenance=='static'?'':' ~'}</td></tr>`).join('')||'<tr><td colspan=3 class="mut">nothing depends on the changed code</td></tr>'}</tbody></table>`}
+function clearGraph(){if(cy){cy.destroy();cy=null}$('#legend').textContent=''}
+function drawGraph(g){clearGraph();if(typeof cytoscape=='undefined'){$('#cy').innerHTML='<p class="mut" style="padding:12px">Graph library failed to load (offline?). The lists still work.</p>';return}
+ const col={changed:'#e03131',impacted:'#f08c00',test:'#2f9e44',requirement:'#1c7ed6'};
+ cy=cytoscape({container:$('#cy'),elements:[...g.nodes.map(n=>({data:{id:n.id,label:n.label,role:n.role,d:n.distance}})),...g.edges.map(([s,t])=>({data:{source:s,target:t}}))],
+  style:[{selector:'node',style:{label:'data(label)','font-size':9,color:getComputedStyle(document.body).color,'text-wrap':'ellipsis','text-max-width':110,'background-color':e=>col[e.data('role')],width:16,height:16}},
+   {selector:'node[role="requirement"]',style:{shape:'diamond',width:20,height:20}},{selector:'node[role="test"]',style:{shape:'round-rectangle'}},
+   {selector:'node[role="changed"]',style:{width:24,height:24}},
+   {selector:'edge',style:{width:1.5,'line-color':'#8b93a3','target-arrow-color':'#8b93a3','target-arrow-shape':'triangle','curve-style':'bezier'}}],
+  layout:{name:'breadthfirst',directed:true,roots:g.nodes.filter(n=>n.role=='changed').map(n=>'#'+CSS.escape(n.id)),spacingFactor:1.1,padding:10}});
+ cy.on('tap','node',e=>{const n=e.target.data();if(n.role!='requirement')openSym(n.id);else openTrace(n.id.slice(4))});
+ $('#legend').innerHTML='<span style="color:#e03131">●</span> changed &nbsp;<span style="color:#f08c00">●</span> affected &nbsp;<span style="color:#2f9e44">▪</span> test &nbsp;<span style="color:#1c7ed6">◆</span> requirement &nbsp;· arrows point from dependency to dependent · click a node for its code'}
+status().then(loadReqs);
+</script></body></html>

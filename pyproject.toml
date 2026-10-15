@@ -11,10 +11,15 @@ dependencies = ["tree-sitter>=0.22", "tree-sitter-python>=0.21", "networkx>=3.0"
 
 [project.optional-dependencies]
 quality = ["ruff", "pyright"]
+mcp = ["mcp>=1.2"]
 dev = ["pytest"]
 
 [project.scripts]
 tracegraph = "tracegraph.cli:main"
+tracegraph-mcp = "tracegraph.mcp_server:main"
+
+[tool.setuptools.package-data]
+tracegraph = ["ui/*.html"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

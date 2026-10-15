@@ -1,0 +1,4 @@
+src/tracegraph.egg-info/
+src/tracegraph/__pycache__/
+tests/__pycache__/
+pythonProjects/UniSchedule/
