@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 
-from . import impact as imp, requirements as rq
+from . import impact as imp, requirements as rq, semantic as sem
 from .graph import connect, index_repo
 
 REQ_FILES = ("requirements.yaml", "requirements.yml")
@@ -81,13 +81,15 @@ class Workspace:
                           "is_test": bool(n["is_test"]), **json.loads(n["attrs"] or "{}")}}
         if include_source:
             out["source"] = self._source(n)
+        out["intent"] = sem.semantics_for(c, self.repo, n)
         out["calls"] = edges("SELECT dst x, line, confidence c, provenance p FROM edges WHERE src=? AND kind='calls' ORDER BY line")
         out["called_by"] = edges("SELECT src x, line, confidence c, provenance p FROM edges WHERE dst=? AND kind='calls' ORDER BY src")
         out["inherits"] = [r["x"] for r in c.execute("SELECT dst x FROM edges WHERE src=? AND kind='inherits'", (t,))]
         out["subclasses"] = [r["x"] for r in c.execute("SELECT src x FROM edges WHERE dst=? AND kind='inherits'", (t,))]
         out["tests_reaching_this"] = [{"pytest_id": x["pytest_id"], "distance": x["distance"]} for x in res["tests"][:15]]
         out["requirements"] = [{"id": r["id"], "title": r["title"], "status": r["status"],
-                                "relation": "implements" if r["distance"] == 0 else f"via callers (distance {r['distance']})"}
+                                "relation": "implements" if r["distance"] == 0 else f"via callers (distance {r['distance']})",
+                                **({"inferred_link": True, "confidence": r["confidence"]} if r.get("inferred") else {})}
                                for r in res["requirements"]]
         out["diagnostics"] = [{"tool": d["tool"], "code": d["code"], "line": d["line"], "message": d["message"]}
                               for d in c.execute("SELECT * FROM diagnostics WHERE node_id=?", (t,))]
@@ -106,12 +108,29 @@ class Workspace:
                "affected_total": len(imp_),
                "tests_to_run": tests,
                "requirements": [{"id": r["id"], "title": r["title"], "status": r["status"], "distance": r["distance"],
-                                 "declared_tests": r["declared_tests"]} for r in res["requirements"]]}
+                                 "declared_tests": r["declared_tests"],
+                                 **({"inferred_link": True, "confidence": r["confidence"]} if r.get("inferred") else {})}
+                                for r in res["requirements"]]}
         if tests:
             out["run_command"] = "pytest " + " ".join(tests)
         out["note"] = ("confidence<0.9 / heuristic edges come from name matching without type inference; "
                        "treat as 'possibly affected'")
         return out
+
+    @staticmethod
+    def _with_summaries(c, out, n=15):
+        items = out.get("changed", []) + out.get("affected", [])[:n]
+        ids = [x["id"] for x in items]
+        if ids:
+            rows = {r["node_id"]: r["summary"] for r in c.execute(
+                f"SELECT node_id, summary FROM semantics WHERE node_id IN ({','.join('?' * len(ids))})", ids)}
+            for x in items:
+                if x["id"] in rows:
+                    x["summary"] = rows[x["id"]]
+        return out
+
+    def search_by_intent(self, query: str, limit: int = 10) -> dict:
+        return {"matches": sem.search_by_intent(self.conn(), query, limit)}
 
     def impact_of_diff(self, base: str = "HEAD", depth: int = 6, min_confidence: float = 0.0) -> dict:
         c = self.conn()
@@ -121,7 +140,7 @@ class Workspace:
             return {"error": f"git diff failed: {e}"}
         if not seeds:
             return {"changed": [], "note": f"no changed Python symbols vs {base}"}
-        return self._compact(imp.impact(c, seeds, depth, min_confidence))
+        return self._with_summaries(c, self._compact(imp.impact(c, seeds, depth, min_confidence)))
 
     def impact_of_symbols(self, targets: list[str], depth: int = 6, min_confidence: float = 0.0) -> dict:
         c = self.conn()
@@ -131,7 +150,7 @@ class Workspace:
             if err:
                 return err
             seeds[t] = []
-        return self._compact(imp.impact(c, seeds, depth, min_confidence))
+        return self._with_summaries(c, self._compact(imp.impact(c, seeds, depth, min_confidence)))
 
     def requirements_for(self, target: str) -> dict:
         c = self.conn()
@@ -141,7 +160,8 @@ class Workspace:
         res = imp.impact(c, {t: []}, depth=6)
         return {"symbol": t, "requirements": [
             {"id": r["id"], "title": r["title"], "status": r["status"],
-             "relation": "implements" if r["distance"] == 0 else f"depends on this via callers (distance {r['distance']})"}
+             "relation": "implements" if r["distance"] == 0 else f"depends on this via callers (distance {r['distance']})",
+             **({"inferred_link": True, "confidence": r["confidence"]} if r.get("inferred") else {})}
             for r in res["requirements"]]}
 
     def list_requirements(self, status: str | None = None) -> dict:
@@ -149,6 +169,7 @@ class Workspace:
         return {"requirements": [
             {"id": r["id"], "title": r["title"], "status": r["status"], "implemented_by": r["implementations"],
              "tests_reaching": r["tests_reaching"], "declared_tests": r["declared_tests"],
+             **({"inferred_links": r["inferred"]} if r["inferred"] else {}),
              **({"unmatched_patterns": r["unmatched_patterns"]} if r["unmatched_patterns"] else {}),
              **({"design": r["design"]} if r["design"] else {})}
             for r in rows if not status or r["status"] == status]}

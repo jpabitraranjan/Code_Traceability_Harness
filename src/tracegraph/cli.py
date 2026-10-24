@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import impact as imp, requirements as rq
 from .graph import connect, index_repo, to_networkx
+from .llm import LLMError
 
 
 def _db(a) -> Path:
@@ -115,6 +116,61 @@ def cmd_find(a):
         print("no matches")
 
 
+def cmd_search(a):
+    from . import semantic
+    rows = semantic.search_by_intent(connect(_db(a)), a.query, a.limit)
+    if a.json:
+        print(json.dumps(rows, indent=2))
+    for r in ([] if a.json else rows):
+        print(f"{r['score']:>5}  {r['id']}  [{r['kind']}] L{r['lines']}" + (f"\n       {r['summary']}" if r.get("summary") else ""))
+    if not rows and not a.json:
+        print("no matches")
+
+
+def cmd_llm(a):
+    from . import llm, semantic
+    cfg = llm.resolve_config(a.repo, a.llm, a.llm_url)
+    conn = connect(_db(a))
+    if a.act == "config":
+        if a.llm or a.llm_url:
+            llm.save_config(a.repo, cfg)
+            print("saved to .tracegraph/llm.json")
+        print(f"provider={cfg.provider or '-'}  model={cfg.model or '-'}  url={cfg.base_url or '(provider default)'}")
+        return
+    if a.act == "usage":
+        u = llm.usage_summary(conn)
+        print(json.dumps(u, indent=2) if a.json else "\n".join(
+            [f"{r['task']:<10} {r['model']:<28} calls={r['calls']:<4} tokens={r['prompt_tokens']}+{r['completion_tokens']} "
+             f"time={r['seconds']}s failed={r['failed']}" for r in u["by_task"]]
+            + [f"TOTAL      calls={u['calls']} tokens={u['prompt_tokens']}+{u['completion_tokens']} time={u['seconds']}s"]))
+        return
+    if a.act == "models":
+        cfg.model = cfg.model or "-"
+    client = llm.make_client(cfg)
+
+    def prog(n, total, what):
+        print(f"\r  {n}/{total}  {str(what)[-60:]:<60}", end="", file=sys.stderr, flush=True)
+
+    if a.act == "models":
+        print("\n".join(client.models()))
+        return
+    if a.act == "test":
+        res = llm.ping(client)
+    elif a.act == "summarize":
+        res = semantic.summarize(a.repo, conn, client, limit=a.limit, force=a.force,
+                                 include_tests=a.include_tests, workers=a.workers, progress=prog)
+    elif a.act == "link":
+        res = semantic.infer_links(a.repo, conn, client, a.min_confidence, progress=prog)
+    else:
+        res = semantic.draft_requirements(a.repo, conn, client, out_path=a.out, progress=prog)
+    print(file=sys.stderr)
+    if a.act == "draft":
+        print(f"wrote {res['path']}  ({res['count']} requirements, {res['dropped_invalid_ids']} invalid ids dropped)\n"
+              "Review it, save as requirements.yaml, then: tracegraph index")
+    else:
+        print(json.dumps(res) if a.json else "  ".join(f"{k}={v}" for k, v in res.items()))
+
+
 def cmd_ui(a):
     from .server import serve
     serve(a.repo, a.db, a.requirements, port=a.port, open_browser=not a.no_browser)
@@ -151,11 +207,33 @@ def main(argv=None):
     p = add("export", cmd_export, "dump the graph as JSON"); p.add_argument("--out")
     p = add("find", cmd_find, "search symbols by name or id fragment")
     p.add_argument("query"); p.add_argument("--limit", type=int, default=20)
+    p = add("search", cmd_search, "find code by what it does (best after `llm summarize`)")
+    p.add_argument("query"); p.add_argument("--limit", type=int, default=10)
+    lp = sub.add_parser("llm", help="LLM layer: config | models | test | summarize | link | draft | usage")
+    lsub = lp.add_subparsers(dest="act", required=True)
+    for act, h in (("config", "show or set provider:model"), ("models", "list models the provider offers"),
+                   ("test", "ping the model"), ("summarize", "intent summaries for symbols (cached by source hash)"),
+                   ("link", "infer requirement -> code/test links"), ("draft", "draft a requirements file from the code"),
+                   ("usage", "tokens and time spent on LLM calls")):
+        q = lsub.add_parser(act, help=h)
+        q.add_argument("--repo", default="."); q.add_argument("--db"); q.add_argument("--json", action="store_true")
+        q.add_argument("--llm", help="provider:model, e.g. ollama:qwen2.5-coder:7b"); q.add_argument("--llm-url")
+        q.set_defaults(fn=cmd_llm)
+        if act == "summarize":
+            q.add_argument("--limit", type=int, default=200); q.add_argument("--force", action="store_true")
+            q.add_argument("--include-tests", action="store_true"); q.add_argument("--workers", type=int, default=2)
+        if act == "link":
+            q.add_argument("--min-confidence", type=float, default=0.6)
+        if act == "draft":
+            q.add_argument("--out", help="default: <repo>/requirements.draft.yaml")
     p = add("ui", cmd_ui, "start the local web UI (views: requirements, traceability, change impact)")
     p.add_argument("--port", type=int, default=8765); p.add_argument("--no-browser", action="store_true")
     p.add_argument("--requirements", help="requirements.yaml (auto-detected in the repo root)")
     a = ap.parse_args(argv)
-    a.fn(a)
+    try:
+        a.fn(a)
+    except LLMError as e:
+        sys.exit(f"error: {e}")
 
 
 if __name__ == "__main__":

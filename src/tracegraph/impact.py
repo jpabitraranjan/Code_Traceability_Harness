@@ -106,12 +106,15 @@ def impact(conn, seeds: dict[str, list[int]], depth: int = 6, min_conf: float = 
 
     affected = set(seeds) | set(found)
     reqs: dict[str, dict] = {}
-    for r in conn.execute("SELECT src, dst FROM edges WHERE kind='implements'"):
+    for r in conn.execute("SELECT src, dst, provenance, confidence FROM edges WHERE kind='implements'"):
         if r["dst"] in affected:
             d = 0 if r["dst"] in seeds else found[r["dst"]]["distance"]
-            e = reqs.setdefault(r["src"][4:], {"id": r["src"][4:], "distance": d, "via": []})
+            e = reqs.setdefault(r["src"][4:], {"id": r["src"][4:], "distance": d, "via": [], "inferred": True,
+                                               "confidence": 0.0})
             e["distance"] = min(e["distance"], d)
             e["via"].append(r["dst"])
+            e["inferred"] = e["inferred"] and r["provenance"] == "inferred"  # any declared link makes it declared
+            e["confidence"] = max(e["confidence"], r["confidence"])
     titles = {r["id"]: (r["title"], r["status"]) for r in conn.execute("SELECT id,title,status FROM requirements")}
     for rid, e in reqs.items():
         e["title"], e["status"] = titles.get(rid, ("", ""))

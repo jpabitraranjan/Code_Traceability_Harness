@@ -28,13 +28,21 @@ CREATE INDEX IF NOT EXISTS e_dst ON edges(dst);
 CREATE INDEX IF NOT EXISTS n_path ON nodes(path);
 CREATE TABLE IF NOT EXISTS requirements(id TEXT PRIMARY KEY, title TEXT, status TEXT, description TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS diagnostics(node_id TEXT, tool TEXT, code TEXT, severity TEXT, message TEXT, line INT);
+CREATE TABLE IF NOT EXISTS semantics(node_id TEXT PRIMARY KEY, summary TEXT, intent TEXT, effects TEXT,
+    source_hash TEXT, model TEXT, created REAL);
+CREATE TABLE IF NOT EXISTS inferences(src TEXT, dst TEXT, kind TEXT, confidence REAL, rationale TEXT, model TEXT,
+    PRIMARY KEY(src, dst, kind));
+CREATE TABLE IF NOT EXISTS llm_usage(task TEXT, model TEXT, prompt_tokens INT, completion_tokens INT,
+    seconds REAL, ok INT, created REAL);
 """
 
 
 def connect(db) -> sqlite3.Connection:
     Path(db).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db))
+    conn = sqlite3.connect(str(db), timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")  # the UI reads while an LLM job writes
     conn.executescript(SCHEMA)
     return conn
 

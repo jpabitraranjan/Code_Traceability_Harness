@@ -59,3 +59,25 @@ their views. Still invisible: ORM managers (`Model.objects`), signals, admin reg
         implemented_by: ["shop/billing.py::calculate_tax", "shop/rates.py"]   # fnmatch on symbol ids
         verified_by: ["tests/test_shop.py::test_tax"]
 Auto-detected as `requirements.yaml` in the repo root.
+
+## LLM layer (intent / semantic analysis)
+
+Pick any model, like Ollama. No extra dependencies; keys come from the environment only.
+
+    tracegraph llm config --llm ollama:qwen2.5-coder:7b          # saved to .tracegraph/llm.json
+    #   openai:<model> (set OPENAI_API_KEY; --llm-url for LM Studio / vLLM / Groq / any OpenAI-compatible server)
+    #   anthropic:<model> (set ANTHROPIC_API_KEY)
+    tracegraph llm models            # what the provider offers
+    tracegraph llm test
+    tracegraph llm summarize --limit 200     # 1-line summary + intent + side effects per symbol; cached by source hash
+    tracegraph llm draft                     # writes requirements.draft.yaml from README + code + routes: review it, then rename
+    tracegraph llm link                      # proposes requirement -> code/test links (kept as `inferred`, with confidence)
+    tracegraph llm usage                     # tokens + time per task: the indexing cost for your benchmark
+    tracegraph search "where are timetable clashes checked"   # find code by intent
+
+Design rules: static facts and model output are stored separately. LLM links are `inferred` with a confidence and
+a rationale, never mixed into declared links; invalid or hallucinated ids are dropped; summaries are flagged
+`stale` when the code changed since they were written; re-indexing keeps them. Agents get `intent` in
+`get_context`, one-line summaries on affected symbols, and a `search_by_intent` MCP tool.
+In the web UI use the LLM bar (provider, model, Save, List models, Test, Summarize code, Infer links, Draft requirements).
+Tested against stub servers for each API shape and a deterministic fake model, not against live providers.

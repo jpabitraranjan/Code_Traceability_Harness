@@ -39,7 +39,7 @@ def _patterns(pats):
 
 
 def link(conn) -> None:
-    conn.execute("DELETE FROM edges WHERE provenance = 'declared'")
+    conn.execute("DELETE FROM edges WHERE provenance IN ('declared', 'inferred')")
     conn.execute("DELETE FROM nodes WHERE kind = 'requirement'")
     code = [r["id"] for r in conn.execute("SELECT id FROM nodes WHERE kind NOT IN ('external','requirement')")]
     for r in conn.execute("SELECT * FROM requirements").fetchall():
@@ -53,6 +53,11 @@ def link(conn) -> None:
                     if "<module>" in n and "<module>" not in pat:
                         continue
                     conn.execute("INSERT INTO edges VALUES(?,?,?,?,?,?)", (rid, n, kind, "declared", 1.0, None))
+    known, codeset = {f"REQ:{r['id']}" for r in conn.execute("SELECT id FROM requirements")}, set(code)
+    for r in conn.execute("SELECT * FROM inferences").fetchall():  # LLM-proposed links, kept apart from declared ones
+        if r["src"] in known and r["dst"] in codeset:
+            conn.execute("INSERT INTO edges VALUES(?,?,?,?,?,?)",
+                         (r["src"], r["dst"], r["kind"], "inferred", r["confidence"], None))
     conn.commit()
 
 
@@ -77,7 +82,9 @@ def report(conn) -> list[dict]:
                 reach |= (nx.descendants(D, s) | {s}) & tests
         unmatched = [p for p in d.get("implemented_by", []) or []
                      if not any(fnmatch.fnmatch(i, p if "::" in p else p + "::*") for i in impl)]
-        rows.append({"id": r["id"], "title": r["title"], "status": r["status"],
+        n_inf = conn.execute("SELECT count(*) FROM edges WHERE src=? AND kind='implements' AND provenance='inferred'",
+                             (rid,)).fetchone()[0]
+        rows.append({"id": r["id"], "title": r["title"], "status": r["status"], "inferred": n_inf,
                      "implementations": impl, "unmatched_patterns": unmatched,
                      "tests_reaching": sorted(reach), "declared_tests": declared,
                      "design": d.get("design", [])})

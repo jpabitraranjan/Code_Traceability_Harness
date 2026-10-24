@@ -37,12 +37,24 @@ h3{margin:14px 0 6px;font-size:13px;color:var(--mut);text-transform:uppercase;le
  <button class="p" id="index">Index</button><span id="msg" class="mut"></span>
 </header>
 <div id="stat"></div>
+<div id="llmbar" class="row2" style="padding:6px 14px;margin:0;border-bottom:1px solid var(--line)">
+ <b class="mut">LLM</b>
+ <select id="prov"><option value="">provider…</option><option>ollama</option><option>openai</option><option>anthropic</option></select>
+ <input id="model" list="models" placeholder="model" size="20"><datalist id="models"></datalist>
+ <input id="murl" placeholder="base URL (optional)" size="20">
+ <button id="lsave">Save</button><button id="lmods">List models</button><button id="ltest">Test</button>
+ <button id="lsum" title="intent summaries for the most connected symbols">Summarize code</button>
+ <button id="llink" title="propose requirement to code links">Infer links</button>
+ <button id="ldraft" title="draft requirements from the code">Draft requirements</button>
+ <span id="lmsg" class="mut"></span>
+</div>
 <nav><button data-t="a" class="on">A · Requirements</button><button data-t="b">B · Traceability</button><button data-t="c">C · Change impact</button></nav>
 <main>
 <section id="a" class="on">
  <div class="row2"><input id="q" placeholder="search requirements"><select id="st"><option value="">any status</option><option>planned</option><option>partial</option><option>implemented</option></select></div>
  <table><thead><tr><th>ID</th><th>Title</th><th>Status</th><th>Code</th><th>Tests</th><th>Coverage</th></tr></thead><tbody id="reqs"></tbody></table>
- <p id="noreq" class="mut" style="display:none">No requirements loaded. Put a requirements.yaml in the repo (see README), enter its path above and press Index.</p>
+ <p id="noreq" class="mut" style="display:none">No requirements loaded. Put a requirements.yaml in the repo (see README), enter its path above and press Index, or use <b>Draft requirements</b> above to have the model propose some.</p>
+ <div id="draftbox"></div>
 </section>
 <section id="b"><p class="mut">Pick a requirement in view A.</p><div id="trace"></div></section>
 <section id="c">
@@ -78,7 +90,7 @@ async function loadReqs(){const r=await api(`/api/requirements?q=${encodeURIComp
  $('#noreq').style.display=r.requirements.length||$('#q').value||$('#st').value?'none':'block';
  const cc={tested:'ok','untested':'warn','no-code':'bad'};
  $('#reqs').innerHTML=r.requirements.map(x=>`<tr class="row" data-req="${esc(x.id)}"><td><b>${esc(x.id)}</b></td><td>${esc(x.title)}${x.unmatched.length?`<div class="warn" style="font-size:12px">no code matches: ${esc(x.unmatched.join(', '))}</div>`:''}</td>
- <td><span class="b">${esc(x.status)}</span></td><td>${x.implementations}</td><td>${x.tests}${x.declared_tests?` <span class="mut">(${x.declared_tests} declared)</span>`:''}</td><td class="${cc[x.coverage]}">${x.coverage}</td></tr>`).join('')}
+ <td><span class="b">${esc(x.status)}</span></td><td>${x.implementations}${x.inferred?` <span class="mut">(${x.inferred} inferred)</span>`:''}</td><td>${x.tests}${x.declared_tests?` <span class="mut">(${x.declared_tests} declared)</span>`:''}</td><td class="${cc[x.coverage]}">${x.coverage}</td></tr>`).join('')}
 $('#reqs').onclick=e=>{const r=e.target.closest('[data-req]');if(r)openTrace(r.dataset.req)};
 $('#q').oninput=loadReqs;$('#st').onchange=loadReqs;
 
@@ -87,7 +99,8 @@ async function openTrace(id){tab('b');$('#b>p').style.display='none';try{const t
  const tests=t.declared_tests.map(x=>`<li>${esc(x)}</li>`).join('')||'<li class="mut">none declared</li>';
  $('#trace').innerHTML=`<div class="card"><b>${esc(t.id)}</b> · ${esc(t.title)} <span class="b">${esc(t.status)}</span><div class="mut">${esc(t.description)}</div></div>
  <details open><summary><b>Design decisions</b></summary><ul>${t.design.map(d=>`<li>${esc(d)}</li>`).join('')||'<li class="mut">none recorded</li>'}</ul></details>
- <details open><summary><b>Implementation</b> (${t.implementations.length})</summary>${t.implementations.map(i=>`<details open><summary>${sym(i.id)} <span class="mut">${i.kind} L${i.lines}</span>${i.diagnostics?` <span class="warn">${i.diagnostics} lint</span>`:''}</summary>
+ <details open><summary><b>Implementation</b> (${t.implementations.length})</summary>${t.implementations.map(i=>`<details open><summary>${sym(i.id)} <span class="mut">${i.kind} L${i.lines}</span>${i.diagnostics?` <span class="warn">${i.diagnostics} lint</span>`:''}${i.inferred?` <span class="b warn" title="${esc(i.rationale)}">inferred ${i.confidence.toFixed(2)}</span>`:''}</summary>
+  ${i.summary?`<div class="mut" style="margin-left:14px">${esc(i.summary)}</div>`:''}
   <div class="mut" style="margin-left:14px">calls: ${i.calls.map(sym).join(', ')||'–'}${i.external_calls?` · ${i.external_calls} external`:''}</div>
   <ul>${i.tests.map(x=>`<li>${esc(x.pytest_id)} <span class="mut">distance ${x.distance}</span>${x.declared?' <span class="ok">declared</span>':''}</li>`).join('')||'<li class="warn">no test reaches this code</li>'}</ul></details>`).join('')||'<p class="warn">No code linked.</p>'}</details>
  <details open><summary><b>Declared verification</b></summary><ul>${tests}</ul></details>`}catch(e){$('#trace').innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
@@ -96,7 +109,7 @@ async function openTrace(id){tab('b');$('#b>p').style.display='none';try{const t
 async function openSym(id){const d=$('#drawer');d.style.display='block';d.innerHTML='loading…';try{const s=await api('/api/symbol?id='+encodeURIComponent(id));
  const edges=(l,t)=>l&&l.length?`<h3>${t}</h3>`+l.map(x=>x.truncated?`<div class="mut">+${x.truncated} more</div>`:`<div>${sym(x.id)} <span class="mut">${x.line?'L'+x.line:''}${x.heuristic?' · heuristic':''}</span></div>`).join(''):'';
  d.innerHTML=`<button onclick="$('#drawer').style.display='none'" style="float:right">Close</button><b>${esc(s.symbol.id)}</b><div class="mut">${esc(s.symbol.kind)} · L${esc(s.symbol.lines)}${s.symbol.is_test?' · test':''}</div>
- ${s.source?`<pre>${esc(s.source)}</pre>`:''}${edges(s.called_by,'Called by')}${edges(s.calls,'Calls')}
+ ${intentBlock(s.intent)}${s.source?`<pre>${esc(s.source)}</pre>`:''}${edges(s.called_by,'Called by')}${edges(s.calls,'Calls')}
  ${s.tests_reaching_this?`<h3>Tests reaching this</h3>`+s.tests_reaching_this.map(t=>`<div>${esc(t.pytest_id)} <span class="mut">d=${t.distance}</span></div>`).join(''):''}
  ${s.requirements?`<h3>Requirements</h3>`+s.requirements.map(r=>`<div><a class="s" onclick="openTrace('${esc(r.id)}')">${esc(r.id)}</a> ${esc(r.title)} <span class="mut">${esc(r.relation)}</span></div>`).join(''):''}
  ${s.diagnostics?`<h3>Findings</h3>`+s.diagnostics.map(x=>`<div class="warn">L${x.line} ${esc(x.code)} ${esc(x.message)}</div>`).join(''):''}`}catch(e){d.innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
@@ -115,7 +128,7 @@ $('#go').onclick=async()=>{$('#res').innerHTML='analyzing…';try{const r=await 
 function showImpact(r){const cmd=r.tests.length?'pytest '+r.tests.map(t=>t.pytest_id).join(' '):'';
  $('#res').innerHTML=`<div class="card"><b>${r.changed.length}</b> changed → <b>${r.impacted.length}</b> affected · <b>${r.tests.length}</b> tests · <b>${r.requirements.length}</b> requirements</div>
  ${cmd?`<h3>Tests to run</h3><pre id="cmd">${esc(cmd)}</pre><button onclick="navigator.clipboard.writeText($('#cmd').textContent)">Copy</button>`:''}
- ${r.requirements.length?'<h3>Requirements affected</h3>'+r.requirements.map(q=>`<div><a class="s" onclick="openTrace('${esc(q.id)}')">${esc(q.id)}</a> ${esc(q.title)} <span class="mut">distance ${q.distance}</span></div>`).join(''):''}
+ ${r.requirements.length?'<h3>Requirements affected</h3>'+r.requirements.map(q=>`<div><a class="s" onclick="openTrace('${esc(q.id)}')">${esc(q.id)}</a> ${esc(q.title)} <span class="mut">distance ${q.distance}</span>${q.inferred?` <span class="b warn" title="LLM-proposed link">inferred ${q.confidence.toFixed(2)}</span>`:''}</div>`).join(''):''}
  <h3>Potentially affected</h3><table><thead><tr><th>d</th><th>symbol</th><th>conf</th></tr></thead><tbody>${r.impacted.map(i=>`<tr><td>${i.distance}</td><td>${sym(i.id)}<div class="mut" style="font-size:12px">${i.kind}${i.call_line?' · call at L'+i.call_line:''}</div></td><td class="${i.provenance=='static'?'':'warn'}">${i.confidence.toFixed(2)}${i.provenance=='static'?'':' ~'}</td></tr>`).join('')||'<tr><td colspan=3 class="mut">nothing depends on the changed code</td></tr>'}</tbody></table>`}
 function clearGraph(){if(cy){cy.destroy();cy=null}$('#legend').textContent=''}
 function drawGraph(g){clearGraph();if(typeof cytoscape=='undefined'){$('#cy').innerHTML='<p class="mut" style="padding:12px">Graph library failed to load (offline?). The lists still work.</p>';return}
@@ -128,5 +141,19 @@ function drawGraph(g){clearGraph();if(typeof cytoscape=='undefined'){$('#cy').in
   layout:{name:'breadthfirst',directed:true,roots:g.nodes.filter(n=>n.role=='changed').map(n=>'#'+CSS.escape(n.id)),spacingFactor:1.1,padding:10}});
  cy.on('tap','node',e=>{const n=e.target.data();if(n.role!='requirement')openSym(n.id);else openTrace(n.id.slice(4))});
  $('#legend').innerHTML='<span style="color:#e03131">●</span> changed &nbsp;<span style="color:#f08c00">●</span> affected &nbsp;<span style="color:#2f9e44">▪</span> test &nbsp;<span style="color:#1c7ed6">◆</span> requirement &nbsp;· arrows point from dependency to dependent · click a node for its code'}
-status().then(loadReqs);
+
+// ---- LLM bar
+function intentBlock(i){return i?`<div class="card"><b>${esc(i.summary)}</b><div class="mut">${esc(i.intent)}${i.stale?' · <span class="warn">stale: code changed since this was written</span>':''}</div>${(i.effects||[]).map(x=>`<span class="b chip">${esc(x)}</span>`).join('')}<div class="mut" style="font-size:12px">LLM-written (${esc(i.model)}), may be wrong</div></div>`:''}
+const lm=(t,bad)=>{$('#lmsg').textContent=t;$('#lmsg').className=bad?'bad':'mut'};
+async function llmCfg(){try{const c=await api('/api/llm/config');$('#prov').value=c.provider;$('#model').value=c.model;$('#murl').value=c.base_url;
+ lm(c.usage.calls?`${c.usage.calls} LLM calls · ${c.usage.prompt_tokens}+${c.usage.completion_tokens} tokens · ${c.usage.seconds}s`:(c.ready?'':'choose a provider and model'))}catch(e){lm(e.message,1)}}
+async function llmSave(){await api('/api/llm/set',{provider:$('#prov').value,model:$('#model').value.trim(),base_url:$('#murl').value.trim()})}
+$('#lsave').onclick=async()=>{try{await llmSave();await llmCfg();lm('saved')}catch(e){lm(e.message,1)}};
+$('#lmods').onclick=async()=>{try{await llmSave();const r=await api('/api/llm/models');$('#models').innerHTML=r.models.map(m=>`<option>${esc(m)}</option>`).join('');lm(r.models.length+' models: type or pick one')}catch(e){lm(e.message,1)}};
+async function runLLM(task,extra){try{await llmSave();await api('/api/llm/run',{task,...extra});pollJob()}catch(e){lm(e.message,1)}}
+async function pollJob(){try{const j=await api('/api/llm/job');if(j.state=='idle')return;lm(`${j.task}: ${j.state}${j.total?` ${j.done}/${j.total}`:''} ${j.message||''}`,j.state=='error');
+ if(j.state=='running')return setTimeout(pollJob,1000);
+ if(j.state=='done'){await status();loadReqs();const r=j.result;if(j.task=='draft'){$('#draftbox').innerHTML=`<div class="card"><b>Draft requirements</b> (${r.count}) saved to <code>${esc(r.path)}</code>. Review it, save as requirements.yaml, then press Index.<pre>${esc(r.yaml)}</pre></div>`;tab('a')}else lm(`${j.task} done: ${JSON.stringify(r)}`)}}catch(e){lm(e.message,1)}}
+$('#ltest').onclick=()=>runLLM('test');$('#lsum').onclick=()=>runLLM('summarize',{limit:100});$('#llink').onclick=()=>runLLM('link');$('#ldraft').onclick=()=>runLLM('draft');
+status().then(loadReqs);llmCfg();pollJob();
 </script></body></html>

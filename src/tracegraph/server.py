@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import impact as imp, requirements as rq
+from . import impact as imp, llm, requirements as rq, semantic
 from .agent_api import Workspace
 from .graph import connect, index_repo
+from .llm import LLMConfig, LLMError
 
 UI_FILE = Path(__file__).parent / "ui" / "index.html"
 
@@ -23,6 +25,7 @@ def _pytest_id(nid_: str) -> str:
 class App:
     def __init__(self, repo, db=None, requirements=None):
         self.lock = threading.Lock()
+        self.job = None
         self.open(repo, db, requirements)
 
     def open(self, repo, db=None, requirements=None):
@@ -44,7 +47,8 @@ class App:
                 "edges": n("SELECT count(*) FROM edges WHERE provenance!='declared'"), "calls": calls,
                 "heuristic_calls": n("SELECT count(*) FROM edges WHERE kind='calls' AND provenance='heuristic'"),
                 "requirements": n("SELECT count(*) FROM requirements"),
-                "diagnostics": n("SELECT count(*) FROM diagnostics")}
+                "diagnostics": n("SELECT count(*) FROM diagnostics"),
+                "summaries": n("SELECT count(*) FROM semantics")}
 
     def requirements(self, q="", status="", **_):
         rows = rq.report(connect(self.ws.db))
@@ -57,7 +61,7 @@ class App:
             cov = "no-code" if not r["implementations"] else ("tested" if r["tests_reaching"] else "untested")
             out.append({"id": r["id"], "title": r["title"], "status": r["status"], "coverage": cov,
                         "implementations": len(r["implementations"]), "tests": len(r["tests_reaching"]),
-                        "declared_tests": len(r["declared_tests"]), "unmatched": r["unmatched_patterns"]})
+                        "declared_tests": len(r["declared_tests"]), "unmatched": r["unmatched_patterns"], "inferred": r["inferred"]})
         return {"requirements": out}
 
     def trace(self, id="", **_):
@@ -70,14 +74,18 @@ class App:
         declared = [_pytest_id(r["dst"]) for r in c.execute(
             "SELECT dst FROM edges WHERE src=? AND kind='verified_by'", (rid,))]
         diag = {r["node_id"]: r["n"] for r in c.execute("SELECT node_id, count(*) n FROM diagnostics GROUP BY node_id")}
+        summ = {r["node_id"]: r["summary"] for r in c.execute("SELECT node_id, summary FROM semantics")}
+        why = {r["dst"]: r["rationale"] for r in c.execute("SELECT dst, rationale FROM inferences WHERE src=? AND kind='implements'", (rid,))}
         impls = []
-        for r in c.execute("SELECT n.* FROM edges e JOIN nodes n ON n.id=e.dst WHERE e.src=? AND e.kind='implements' "
+        for r in c.execute("SELECT n.*, e.provenance prov, e.confidence conf FROM edges e JOIN nodes n ON n.id=e.dst "
+                           "WHERE e.src=? AND e.kind='implements' "
                            "ORDER BY n.path, n.start_line", (rid,)).fetchall():
             res = imp.impact(c, {r["id"]: []}, depth=6)
             callees = [x["dst"] for x in c.execute(
                 "SELECT dst FROM edges WHERE src=? AND kind='calls' ORDER BY line", (r["id"],))]
             impls.append({"id": r["id"], "kind": r["kind"], "lines": f"{r['start_line']}-{r['end_line']}",
-                          "diagnostics": diag.get(r["id"], 0),
+                          "diagnostics": diag.get(r["id"], 0), "summary": summ.get(r["id"], ""),
+                          "inferred": r["prov"] == "inferred", "confidence": r["conf"], "rationale": why.get(r["id"], ""),
                           "calls": [x for x in callees if not x.startswith("ext::")][:10],
                           "external_calls": len([x for x in callees if x.startswith("ext::")]),
                           "tests": [{"pytest_id": t["pytest_id"], "distance": t["distance"],
@@ -136,6 +144,59 @@ class App:
         res = imp.impact(c, seeds, int(depth), float(min_confidence))
         return {"result": res, "graph": _graph(res)}
 
+    # ---- LLM layer
+    def _cfg(self):
+        return llm.resolve_config(self.ws.repo)
+
+    def llm_config(self, **_):
+        cfg = self._cfg()
+        return {"provider": cfg.provider, "model": cfg.model, "base_url": cfg.base_url, "ready": cfg.ready,
+                "usage": llm.usage_summary(connect(self.ws.db))}
+
+    def llm_set(self, provider="", model="", base_url="", **_):
+        llm.save_config(self.ws.repo, LLMConfig(provider.lower(), model, base_url))
+        return self.llm_config()
+
+    def llm_models(self, **_):
+        cfg = self._cfg()
+        cfg.model = cfg.model or "-"
+        return {"models": llm.make_client(cfg).models()}
+
+    def llm_run(self, task="", limit=100, min_confidence=0.6, force=False, **_):
+        if self.job and self.job["state"] == "running":
+            return {"error": "a job is already running"}
+        if task not in ("test", "summarize", "link", "draft"):
+            return {"error": f"unknown task {task}"}
+        client = llm.make_client(self._cfg())
+        repo, db = self.ws.repo, self.ws.db
+        job = self.job = {"task": task, "state": "running", "done": 0, "total": 0, "message": "starting", "result": None}
+
+        def prog(n, total, what):
+            job.update(done=n, total=total, message=str(what)[-70:])
+
+        def run():
+            conn = connect(db)
+            try:
+                if task == "test":
+                    res = llm.ping(client)
+                elif task == "summarize":
+                    res = semantic.summarize(repo, conn, client, limit=int(limit), force=bool(force), progress=prog)
+                elif task == "link":
+                    res = semantic.infer_links(repo, conn, client, float(min_confidence), progress=prog)
+                else:
+                    res = semantic.draft_requirements(repo, conn, client, progress=prog)
+                job.update(state="done", result=res, message="finished")
+            except Exception as e:  # shown in the UI; the job thread must never die silently
+                job.update(state="error", message=f"{type(e).__name__}: {e}")
+            finally:
+                conn.close()
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"started": task}
+
+    def llm_job(self, **_):
+        return self.job or {"state": "idle"}
+
 
 def _graph(res):
     nodes, edges = {}, set()
@@ -180,15 +241,18 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if method == "GET" and url.path == "/":
             return self._send(200, UI_FILE.read_bytes(), "text/html")
-        name = url.path.removeprefix("/api/")
-        allowed = {"GET": {"status", "requirements", "trace", "search", "symbol", "changed"},
-                   "POST": {"index", "repo", "impact"}}[method]
+        name = url.path.removeprefix("/api/").replace("/", "_")
+        allowed = {"GET": {"status", "requirements", "trace", "search", "symbol", "changed",
+                           "llm_config", "llm_models", "llm_job"},
+                   "POST": {"index", "repo", "impact", "llm_set", "llm_run"}}[method]
         if not url.path.startswith("/api/") or name not in allowed:
             return self._send(404, {"error": "not found"})
         try:
             with self.app.lock:
                 out = getattr(self.app, name)(**params)
             self._send(200 if "error" not in out else 400, out)
+        except LLMError as e:
+            self._send(400, {"error": str(e)})
         except Exception as e:  # surface errors to the UI instead of dropping the connection
             self._send(500, {"error": f"{e.__class__.__name__}: {e}"})
 

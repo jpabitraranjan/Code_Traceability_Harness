@@ -19,7 +19,8 @@ INSTRUCTIONS = (
     "requirements). Use it BEFORE editing: get_context to understand a symbol and its neighbours, "
     "impact_of_diff after editing to learn which code, tests and requirements may be affected. "
     "Symbol ids look like 'pkg/mod.py::Class.method'; 'pkg/mod.py:42' (a line) also works. "
-    "Edges with heuristic=true or low confidence are name-matched guesses, not proofs."
+    "Edges with heuristic=true or low confidence are name-matched guesses, not proofs. 'intent'/'summary' fields and "
+    "requirement links marked inferred_link are LLM-written hypotheses (may be stale or wrong); static edges are facts."
 )
 
 
@@ -59,6 +60,12 @@ def build(ws: Workspace):
         """All requirements with status, implementing symbols, tests reaching them, and design notes.
         status filter: planned | partial | implemented."""
         return ws.list_requirements(status)
+
+    @mcp.tool()
+    def search_by_intent(query: str, limit: int = 10) -> dict:
+        """Find code by what it does, in plain language ('where are timetable clashes checked?'). Ranks symbols by
+        name, path and LLM-written intent summaries (summaries exist after `tracegraph llm summarize`)."""
+        return ws.search_by_intent(query, limit)
 
     @mcp.tool()
     def reindex() -> dict:
