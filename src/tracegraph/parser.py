@@ -25,7 +25,9 @@ class Symbol:
 class Call:
     caller: str  # qualname, or "<module>"
     callee: str  # dotted text as written, e.g. "self.save", "tax.compute"
-    line: int
+    line: int    # line where the call expression starts
+    col: int = 0     # byte column of the callee's final name (what a type checker is asked about)
+    nline: int = 0   # line of that name (differs from `line` in multi-line call chains)
 
 
 @dataclass
@@ -179,9 +181,11 @@ def parse(src: bytes) -> Parsed:
             handle_import(node)
         else:
             if ty == "call":
-                d = dotted(node.child_by_field_name("function"))
+                fn = node.child_by_field_name("function")
+                d = dotted(fn)
                 if d:
-                    out.calls.append(Call(caller, d, node.start_point[0] + 1))
+                    nm = fn.child_by_field_name("attribute") if fn.type == "attribute" else fn
+                    out.calls.append(Call(caller, d, node.start_point[0] + 1, nm.start_point[1], nm.start_point[0] + 1))
                     maybe_route(node, d, caller)
             for c in node.children:
                 visit(c, scope, caller)

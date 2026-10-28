@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import os
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 
 import networkx as nx
 
 from .parser import Symbol, parse
 
-PARSER_VERSION = "2"
+PARSER_VERSION = "3"
+HASH_PREFIX = f"v{PARSER_VERSION}:"  # cached parses from an older tracegraph never match, so they are re-parsed
 SKIP_DIRS = {".git", ".hg", ".venv", "venv", "env", "node_modules", "__pycache__", "build", "dist",
              "site-packages", ".tox", ".mypy_cache", ".ruff_cache", ".tracegraph", ".pytest_cache"}
 MAX_BYTES = 1_000_000
@@ -32,9 +35,23 @@ CREATE TABLE IF NOT EXISTS semantics(node_id TEXT PRIMARY KEY, summary TEXT, int
     source_hash TEXT, model TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS inferences(src TEXT, dst TEXT, kind TEXT, confidence REAL, rationale TEXT, model TEXT,
     PRIMARY KEY(src, dst, kind));
+CREATE TABLE IF NOT EXISTS callsites(path TEXT, nline INT, col INT, line INT, caller TEXT, callee TEXT,
+    status TEXT, targets TEXT);
+CREATE INDEX IF NOT EXISTS cs_path ON callsites(path);
+CREATE TABLE IF NOT EXISTS resolutions(path TEXT, nline INT, col INT, line INT, callee TEXT, dst TEXT,
+    confidence REAL, file_hash TEXT, source TEXT, PRIMARY KEY(path, nline, col, dst));
+CREATE TABLE IF NOT EXISTS covlines(test TEXT, path TEXT, lines TEXT, file_hash TEXT, PRIMARY KEY(test, path));
+CREATE TABLE IF NOT EXISTS covlinks(test TEXT, symbol TEXT, hits INT, file_hash TEXT, PRIMARY KEY(test, symbol));
+CREATE TABLE IF NOT EXISTS covrun(ran_at REAL, command TEXT, tests INT, files INT);
 CREATE TABLE IF NOT EXISTS llm_usage(task TEXT, model TEXT, prompt_tokens INT, completion_tokens INT,
     seconds REAL, ok INT, created REAL);
 """
+
+
+def index_is_current(conn) -> bool:
+    """False when the index is empty or was built by an older tracegraph (call columns etc. would be missing)."""
+    rows = [r["hash"] for r in conn.execute("SELECT hash FROM files")]
+    return bool(rows) and all(h.startswith(HASH_PREFIX) for h in rows)
 
 
 def connect(db) -> sqlite3.Connection:
@@ -51,14 +68,36 @@ def nid(path: str, qual: str) -> str:
     return f"{path}::{qual}"
 
 
+def load_ignores(repo: Path) -> list[str]:
+    """<repo>/.tracegraphignore: one glob per line, '#' comments; 'dir/' matches directories only; a pattern with
+    a slash is matched against the repo-relative path, otherwise against the file or directory name."""
+    try:
+        lines = (Path(repo) / ".tracegraphignore").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [x.strip() for x in lines if x.strip() and not x.strip().startswith("#")]
+
+
+def _ignored(rel: str, name: str, is_dir: bool, pats: list[str]) -> bool:
+    for pat in pats:
+        only_dir, pat = pat.endswith("/"), pat.rstrip("/").lstrip("/")
+        if only_dir and not is_dir:
+            continue
+        if fnmatch.fnmatch(rel if "/" in pat else name, pat):
+            return True
+    return False
+
+
 def scan_files(repo: Path):
+    pats = load_ignores(repo)
     for root, dirs, files in os.walk(repo):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.endswith(".egg-info"))
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.endswith(".egg-info") and not _ignored(
+            (Path(root) / d).relative_to(repo).as_posix(), d, True, pats))
         for f in sorted(files):
             if f.endswith(".py"):
                 p = Path(root) / f
                 rel = p.relative_to(repo).as_posix()
-                if SKIP_PATH_PARTS & set(rel.split("/")[:-1]):
+                if SKIP_PATH_PARTS & set(rel.split("/")[:-1]) or _ignored(rel, f, False, pats):
                     continue
                 if p.stat().st_size <= MAX_BYTES:
                     yield rel, p
@@ -296,6 +335,13 @@ def build_graph(conn) -> dict:
     R = Resolver(files)
     nodes: dict[str, tuple] = {}
     edges: set[tuple] = set()
+    callsites: list[tuple] = []
+    ids = {nid(p, s.qualname) for p, f in files.items() for s in f["symbols"]}
+    hashes = {r["path"]: r["hash"] for r in conn.execute("SELECT path, hash FROM files")}
+    typed = defaultdict(list)  # type-checker answers, valid only while the file is unchanged
+    for r in conn.execute("SELECT * FROM resolutions"):
+        if r["dst"] and hashes.get(r["path"]) == r["file_hash"] and (r["dst"] in ("-",) or r["dst"].startswith("ext::") or r["dst"] in ids):
+            typed[(r["path"], r["nline"], r["col"])].append((r["dst"], r["confidence"]))
 
     for path, f in files.items():
         test_file = is_test_file(path)
@@ -335,9 +381,15 @@ def build_graph(conn) -> dict:
                     edges.add((rid, tid, "calls", prov, conf, r.line))
                     break
         for c in f["calls"]:
-            for tid, prov, conf in R.resolve(path, c.caller, c.callee):
+            targets = R.resolve(path, c.caller, c.callee)
+            status = "static" if any(p == "static" for _, p, _ in targets) else ("heuristic" if targets else "unresolved")
+            tk = typed.get((path, c.nline, c.col))
+            if tk and status != "static":  # a type-aware answer replaces name-matching guesses, never static facts
+                targets, status = [(d, "typed", cf) for d, cf in tk if d != "-"], "typed"  # "-": builtin, no edge
+            callsites.append((path, c.nline, c.col, c.line, c.caller, c.callee, status, json.dumps([t[0] for t in targets][:6])))
+            for tid, prov, conf in targets:
                 src = nid(path, c.caller)
-                if tid != src or prov == "static":  # keep real recursion, drop heuristic self-loops
+                if tid != src or prov in ("static", "typed"):  # keep real recursion, drop heuristic self-loops
                     edges.add((src, tid, "calls", prov, conf, c.line))
 
     for e in R.externals | {t for (_, t, *_r) in edges if t.startswith("ext::")}:
@@ -348,6 +400,8 @@ def build_graph(conn) -> dict:
             nodes[t] = (t, "external", t[5:].rsplit(".", 1)[-1], "", 0, 0, 0, "{}")
 
     conn.execute("DELETE FROM nodes")
+    conn.execute("DELETE FROM callsites")
+    conn.executemany("INSERT INTO callsites VALUES(?,?,?,?,?,?,?,?)", callsites)
     conn.execute("DELETE FROM edges WHERE provenance != 'declared'")
     conn.executemany("INSERT INTO nodes VALUES(?,?,?,?,?,?,?,?)", nodes.values())
     conn.executemany("INSERT INTO edges VALUES(?,?,?,?,?,?)", sorted(edges, key=lambda e: tuple(map(str, e))))
@@ -355,6 +409,7 @@ def build_graph(conn) -> dict:
     ncalls = sum(1 for e in edges if e[2] == "calls")
     return {"files": len(files), "nodes": len(nodes), "edges": len(edges), "calls": ncalls,
             "routes": sum(1 for n in nodes.values() if n[1] == "route"),
+            "typed_calls": sum(1 for e in edges if e[2] == "calls" and e[3] == "typed"),
             "heuristic_calls": sum(1 for e in edges if e[2] == "calls" and e[3] == "heuristic")}
 
 
@@ -365,7 +420,7 @@ def index_repo(repo, db, requirements=None, quality=None) -> dict:
     seen, reparsed = set(), 0
     for rel, p in scan_files(repo):
         data = p.read_bytes()
-        h = PARSER_VERSION + hashlib.sha1(data).hexdigest()
+        h = HASH_PREFIX + hashlib.sha1(data).hexdigest()
         seen.add(rel)
         if old.get(rel) == h:
             continue

@@ -15,8 +15,50 @@ def _db(a) -> Path:
     return Path(a.db) if a.db else Path(a.repo).resolve() / ".tracegraph" / "graph.db"
 
 
+def _conn(a):
+    db = _db(a)
+    if not db.exists():  # never create an empty index silently: that made `resolve` look like it had succeeded
+        sys.exit(f"error: no index at {db}\n  run first:  tracegraph index --repo {a.repo}\n"
+                 "  (every command defaults to --repo . ; pass --repo for any other folder)")
+    return connect(db)
+
+
 def _loc(x) -> str:
     return f"{x['id']}  [{x['kind']}] L{x['start']}-{x['end']}"
+
+
+def cmd_resolve(a):
+    from . import typeres
+    conn = _conn(a)
+    last = {}
+
+    def prog(n, total, what):
+        print(f"\r  {n}/{total}  {str(what)[-60:]:<60}", end="", file=sys.stderr, flush=True)
+
+    res = typeres.resolve(a.repo, conn, include_static=a.all, python=a.python, limit=a.limit, progress=prog)
+    print(file=sys.stderr)
+    if a.json:
+        print(json.dumps(res, indent=2))
+        return
+    print("  ".join(f"{k}={v}" for k, v in res.items() if k not in ("disagreements", "message", "hint")))
+    for d in res.get("disagreements", []):
+        print("  disagreement:", d)
+    for k in ("message", "hint"):
+        if res.get(k):
+            print(("hint: " if k == "hint" else "") + res[k])
+
+
+def cmd_coverage(a):
+    from . import covlink
+    conn = _conn(a)
+    if a.act == "run":
+        cmd = [x for x in (a.cmd or [])]
+        res = covlink.run(a.repo, conn, cmd[1:] if cmd[:1] == ["--"] else cmd, a.python)
+    elif a.act == "import":
+        res = covlink.import_data(conn, a.repo)
+    else:
+        res = covlink.status(conn)
+    print(json.dumps(res, indent=2) if a.json else "  ".join(f"{k}={v}" for k, v in res.items()))
 
 
 def cmd_index(a):
@@ -24,11 +66,15 @@ def cmd_index(a):
                                   if (Path(a.repo) / f).exists()), None)
     stats = index_repo(a.repo, _db(a), requirements=req,
                        quality=[t for t in ("ruff", "pyright") if getattr(a, t)] or None)
+    if getattr(a, "resolve", False):
+        from . import typeres
+        r = typeres.resolve(a.repo, _conn(a), python=a.python)
+        stats.update(typed_edges=r.get("typed_edges", 0), heuristic_edges_after=r["heuristic_edges_after"])
     print(json.dumps(stats) if a.json else "  ".join(f"{k}={v}" for k, v in stats.items()))
 
 
 def cmd_impact(a):
-    conn = connect(_db(a))
+    conn = _conn(a)
     if a.symbol:
         seeds = {}
         for s in a.symbol:
@@ -37,8 +83,9 @@ def cmd_impact(a):
                 sys.exit(f"cannot resolve symbol: {s}")
             seeds[t] = []
     else:
-        seeds = imp.seeds_from_diff(conn, a.repo, a.base)
-    res = imp.impact(conn, seeds, depth=a.depth, min_conf=a.min_confidence)
+        seeds = None
+    res = (imp.impact(conn, seeds, depth=a.depth, min_conf=a.min_confidence) if seeds is not None else
+           imp.impact_for_diff(conn, a.repo, a.base, a.depth, a.min_confidence) or {"changed": []})
     if a.json:
         print(json.dumps(res, indent=2))
         return
@@ -56,7 +103,9 @@ def cmd_impact(a):
         print(f"  d={i['distance']} conf={i['confidence']:.2f}  {_loc(i)}  (calls at L{i['call_line']}){flag}")
     print(f"\nTests to run ({len(res['tests'])}):")
     for t in res["tests"]:
-        print(f"  d={t['distance']} conf={t['confidence']:.2f}  {t['pytest_id']}")
+        tag = "+".join(e.replace("runtime-", "ran-") for e in t["evidence"] if e != "static") or "static"
+        note = {"miss": "  (ran the function, not the changed lines)", "not-executed": "  (never executed it when last measured)"}.get(t.get("line_check"), "")
+        print(f"  d={t['distance']} conf={t['confidence']:.2f}  [{tag}]  {t['pytest_id']}{note}")
     if res["requirements"]:
         print(f"\nRequirements affected ({len(res['requirements'])}):")
         for r in res["requirements"]:
@@ -64,7 +113,7 @@ def cmd_impact(a):
 
 
 def cmd_show(a):
-    conn = connect(_db(a))
+    conn = _conn(a)
     t = imp.resolve_target(conn, a.target)
     if not t:
         sys.exit(f"cannot resolve (or ambiguous): {a.target}")
@@ -88,7 +137,7 @@ def cmd_show(a):
 
 
 def cmd_requirements(a):
-    rows = rq.report(connect(_db(a)))
+    rows = rq.report(_conn(a))
     if not rows and not a.json:
         print("No requirements loaded. Create requirements.yaml (see README) and run:\n"
               "  tracegraph index --repo <repo> --requirements requirements.yaml")
@@ -101,10 +150,14 @@ def cmd_requirements(a):
               f"tests={len(r['tests_reaching']):<3} {r['title']}")
         for p in r["unmatched_patterns"]:
             print(f"    ! no code matches: {p}")
+        for p in r["unexecuted"][:5]:
+            print(f"    ! never executed by any test run: {p}")
+        if len(r["unexecuted"]) > 5:
+            print(f"    ! ... and {len(r['unexecuted']) - 5} more never executed")
 
 
 def cmd_find(a):
-    conn = connect(_db(a))
+    conn = _conn(a)
     rows = conn.execute("""SELECT id, kind, start_line, end_line, is_test FROM nodes
         WHERE kind IN ('class','function','method','module','route') AND (name=? OR id LIKE ?)
         ORDER BY (name=?) DESC, length(id) LIMIT ?""", (a.query, f"%{a.query}%", a.query, a.limit)).fetchall()
@@ -118,7 +171,7 @@ def cmd_find(a):
 
 def cmd_search(a):
     from . import semantic
-    rows = semantic.search_by_intent(connect(_db(a)), a.query, a.limit)
+    rows = semantic.search_by_intent(_conn(a), a.query, a.limit)
     if a.json:
         print(json.dumps(rows, indent=2))
     for r in ([] if a.json else rows):
@@ -130,7 +183,7 @@ def cmd_search(a):
 def cmd_llm(a):
     from . import llm, semantic
     cfg = llm.resolve_config(a.repo, a.llm, a.llm_url)
-    conn = connect(_db(a))
+    conn = None if a.act == "config" else _conn(a)
     if a.act == "config":
         if a.llm or a.llm_url:
             llm.save_config(a.repo, cfg)
@@ -177,7 +230,7 @@ def cmd_ui(a):
 
 
 def cmd_export(a):
-    G = to_networkx(connect(_db(a)))
+    G = to_networkx(_conn(a))
     data = {"nodes": [{"id": n, **d} for n, d in G.nodes(data=True)],
             "links": [{"source": s, "target": t, **d} for s, t, d in G.edges(data=True)]}
     (open(a.out, "w") if a.out else sys.stdout).write(json.dumps(data, indent=1))
@@ -198,6 +251,12 @@ def main(argv=None):
     p = add("index", cmd_index, "(re)build the graph; unchanged files are not re-parsed")
     p.add_argument("--requirements", help="requirements.yaml to load and link")
     p.add_argument("--ruff", action="store_true"); p.add_argument("--pyright", action="store_true")
+    p.add_argument("--resolve", action="store_true", help="then resolve uncertain calls with Pyright (type-aware)")
+    p.add_argument("--python", help="interpreter whose installed packages Pyright should see")
+    p = add("resolve", cmd_resolve, "type-aware resolution of heuristic/unresolved calls via Pyright")
+    p.add_argument("--all", action="store_true", help="also cross-check statically resolved calls (reports agreement)")
+    p.add_argument("--python", help="interpreter whose installed packages Pyright should see (default: Pyright's own)")
+    p.add_argument("--limit", type=int, help="ask about at most N call sites")
     p = add("impact", cmd_impact, "what is affected by the current git diff (or given symbols)")
     p.add_argument("--base", default="HEAD"); p.add_argument("--symbol", action="append")
     p.add_argument("--depth", type=int, default=6); p.add_argument("--min-confidence", type=float, default=0.0)
@@ -209,6 +268,16 @@ def main(argv=None):
     p.add_argument("query"); p.add_argument("--limit", type=int, default=20)
     p = add("search", cmd_search, "find code by what it does (best after `llm summarize`)")
     p.add_argument("query"); p.add_argument("--limit", type=int, default=10)
+    cp = sub.add_parser("coverage", help="runtime evidence: run | import | status")
+    csub = cp.add_subparsers(dest="act", required=True)
+    for act, h in (("run", "run your tests under coverage: records which test executed which code (default: pytest)"),
+                   ("import", "re-import coverage data from the last run"), ("status", "what runtime data is loaded")):
+        q = csub.add_parser(act, help=h)
+        q.add_argument("--repo", default="."); q.add_argument("--db"); q.add_argument("--json", action="store_true")
+        q.set_defaults(fn=cmd_coverage)
+        if act == "run":
+            q.add_argument("--python", help="interpreter to run the tests with (needs coverage installed)")
+            q.add_argument("cmd", nargs=argparse.REMAINDER, help="test command after --, e.g. -- python manage.py test")
     lp = sub.add_parser("llm", help="LLM layer: config | models | test | summarize | link | draft | usage")
     lsub = lp.add_subparsers(dest="act", required=True)
     for act, h in (("config", "show or set provider:model"), ("models", "list models the provider offers"),

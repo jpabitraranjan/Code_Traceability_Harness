@@ -8,6 +8,9 @@ pyyaml>=6.0
 ruff
 pyright
 
+# Runtime coverage links (tracegraph coverage run)
+coverage>=7
+
 # Tests (optional)
 pytest
 

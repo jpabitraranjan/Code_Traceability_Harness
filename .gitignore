@@ -3,3 +3,5 @@ src/tracegraph/__pycache__/
 tests/__pycache__/
 pythonProjects/
 .tracegraph/
+.tracegraphignore
+requirements.yaml

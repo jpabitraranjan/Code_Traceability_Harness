@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import impact as imp, llm, requirements as rq, semantic
+from . import impact as imp, llm, requirements as rq, semantic, typeres
 from .agent_api import Workspace
 from .graph import connect, index_repo
 from .llm import LLMConfig, LLMError
@@ -48,7 +48,9 @@ class App:
                 "heuristic_calls": n("SELECT count(*) FROM edges WHERE kind='calls' AND provenance='heuristic'"),
                 "requirements": n("SELECT count(*) FROM requirements"),
                 "diagnostics": n("SELECT count(*) FROM diagnostics"),
-                "summaries": n("SELECT count(*) FROM semantics")}
+                "summaries": n("SELECT count(*) FROM semantics"),
+                "typed_calls": n("SELECT count(*) FROM edges WHERE kind='calls' AND provenance='typed'"),
+                "runtime_tests": n("SELECT count(DISTINCT test) FROM covlines")}
 
     def requirements(self, q="", status="", **_):
         rows = rq.report(connect(self.ws.db))
@@ -61,7 +63,8 @@ class App:
             cov = "no-code" if not r["implementations"] else ("tested" if r["tests_reaching"] else "untested")
             out.append({"id": r["id"], "title": r["title"], "status": r["status"], "coverage": cov,
                         "implementations": len(r["implementations"]), "tests": len(r["tests_reaching"]),
-                        "declared_tests": len(r["declared_tests"]), "unmatched": r["unmatched_patterns"], "inferred": r["inferred"]})
+                        "declared_tests": len(r["declared_tests"]), "unmatched": r["unmatched_patterns"], "inferred": r["inferred"],
+                        "runtime_tests": len(r["runtime_tests"]), "unexecuted": r["unexecuted"]})
         return {"requirements": out}
 
     def trace(self, id="", **_):
@@ -134,6 +137,7 @@ class App:
             self.ws.refresh(force=True)
         c = connect(self.ws.db)
         seeds = imp.seeds_from_diff(c, self.ws.repo, base) if use_diff else {}
+        diff_base = base if use_diff else None
         for t in targets:
             tid = imp.resolve_target(c, t)
             if not tid:
@@ -142,6 +146,8 @@ class App:
         if not seeds:
             return {"error": "nothing selected: load the git diff or add symbols first"}
         res = imp.impact(c, seeds, int(depth), float(min_confidence))
+        if diff_base:
+            imp.refine_with_lines(c, self.ws.repo, diff_base, res)
         return {"result": res, "graph": _graph(res)}
 
     # ---- LLM layer
@@ -162,13 +168,10 @@ class App:
         cfg.model = cfg.model or "-"
         return {"models": llm.make_client(cfg).models()}
 
-    def llm_run(self, task="", limit=100, min_confidence=0.6, force=False, **_):
+    def _start_job(self, task, work):
         if self.job and self.job["state"] == "running":
             return {"error": "a job is already running"}
-        if task not in ("test", "summarize", "link", "draft"):
-            return {"error": f"unknown task {task}"}
-        client = llm.make_client(self._cfg())
-        repo, db = self.ws.repo, self.ws.db
+        db = self.ws.db
         job = self.job = {"task": task, "state": "running", "done": 0, "total": 0, "message": "starting", "result": None}
 
         def prog(n, total, what):
@@ -177,15 +180,7 @@ class App:
         def run():
             conn = connect(db)
             try:
-                if task == "test":
-                    res = llm.ping(client)
-                elif task == "summarize":
-                    res = semantic.summarize(repo, conn, client, limit=int(limit), force=bool(force), progress=prog)
-                elif task == "link":
-                    res = semantic.infer_links(repo, conn, client, float(min_confidence), progress=prog)
-                else:
-                    res = semantic.draft_requirements(repo, conn, client, progress=prog)
-                job.update(state="done", result=res, message="finished")
+                job.update(state="done", result=work(conn, prog), message="finished")
             except Exception as e:  # shown in the UI; the job thread must never die silently
                 job.update(state="error", message=f"{type(e).__name__}: {e}")
             finally:
@@ -193,6 +188,24 @@ class App:
 
         threading.Thread(target=run, daemon=True).start()
         return {"started": task}
+
+    def llm_run(self, task="", limit=100, min_confidence=0.6, force=False, **_):
+        if task not in ("test", "summarize", "link", "draft"):
+            return {"error": f"unknown task {task}"}
+        client = llm.make_client(self._cfg())
+        repo = self.ws.repo
+        works = {
+            "test": lambda conn, prog: llm.ping(client),
+            "summarize": lambda conn, prog: semantic.summarize(repo, conn, client, limit=int(limit), force=bool(force), progress=prog),
+            "link": lambda conn, prog: semantic.infer_links(repo, conn, client, float(min_confidence), progress=prog),
+            "draft": lambda conn, prog: semantic.draft_requirements(repo, conn, client, progress=prog),
+        }
+        return self._start_job(task, works[task])
+
+    def resolve(self, python="", all=False, **_):
+        repo = self.ws.repo
+        return self._start_job("resolve", lambda conn, prog: typeres.resolve(
+            repo, conn, include_static=bool(all), python=python or None, progress=prog))
 
     def llm_job(self, **_):
         return self.job or {"state": "idle"}
@@ -244,7 +257,7 @@ class Handler(BaseHTTPRequestHandler):
         name = url.path.removeprefix("/api/").replace("/", "_")
         allowed = {"GET": {"status", "requirements", "trace", "search", "symbol", "changed",
                            "llm_config", "llm_models", "llm_job"},
-                   "POST": {"index", "repo", "impact", "llm_set", "llm_run"}}[method]
+                   "POST": {"index", "repo", "impact", "llm_set", "llm_run", "resolve"}}[method]
         if not url.path.startswith("/api/") or name not in allowed:
             return self._send(404, {"error": "not found"})
         try:

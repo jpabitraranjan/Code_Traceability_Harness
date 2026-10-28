@@ -19,7 +19,7 @@ tracegraph = "tracegraph.cli:main"
 tracegraph-mcp = "tracegraph.mcp_server:main"
 
 [tool.setuptools.package-data]
-tracegraph = ["ui/*.html"]
+tracegraph = ["ui/*.html", "boot/*.py"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

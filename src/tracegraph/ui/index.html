@@ -34,7 +34,7 @@ h3{margin:14px 0 6px;font-size:13px;color:var(--mut);text-transform:uppercase;le
  <b>tracegraph</b>
  <input id="repo" placeholder="local repo folder"><button id="open">Open</button>
  <input id="req" placeholder="requirements.yaml"><label><input type="checkbox" id="ruff"> Ruff</label>
- <button class="p" id="index">Index</button><span id="msg" class="mut"></span>
+ <button class="p" id="index">Index</button><button id="resolve" title="ask Pyright to resolve calls that name matching could not (type-aware)">Resolve types</button><span id="msg" class="mut"></span>
 </header>
 <div id="stat"></div>
 <div id="llmbar" class="row2" style="padding:6px 14px;margin:0;border-bottom:1px solid var(--line)">
@@ -81,7 +81,7 @@ function tab(t){document.querySelectorAll('nav button').forEach(b=>b.classList.t
 
 async function status(){try{const s=await api('/api/status');$('#repo').value=s.repo;if(!$('#req').value)$('#req').value=s.requirements_file;
  const h=s.calls?Math.round(100*s.heuristic_calls/s.calls):0;
- $('#stat').textContent=`${s.files} files · ${s.symbols} symbols · ${s.tests} tests · ${s.routes} routes · ${s.edges} edges (${h}% of calls heuristic) · ${s.requirements} requirements`+(s.diagnostics?` · ${s.diagnostics} lint findings`:'')}catch(e){msg(e.message,1)}}
+ $('#stat').textContent=`${s.files} files · ${s.symbols} symbols · ${s.tests} tests · ${s.routes} routes · ${s.edges} edges (${h}% of calls heuristic${s.typed_calls?`, ${s.typed_calls} type-resolved`:''})${s.runtime_tests?` · ${s.runtime_tests} tests with runtime coverage`:''} · ${s.requirements} requirements`+(s.diagnostics?` · ${s.diagnostics} lint findings`:'')}catch(e){msg(e.message,1)}}
 $('#index').onclick=async()=>{msg('indexing…');try{const r=await api('/api/index',{requirements:$('#req').value,ruff:$('#ruff').checked});msg(`done · ${r.stats.reparsed} files re-parsed`);await status();loadReqs()}catch(e){msg(e.message,1)}};
 $('#open').onclick=async()=>{msg('opening…');try{await api('/api/repo',{path:$('#repo').value,requirements:$('#req').value});$('#req').value='';picked.clear();msg('');await status();loadReqs();$('#res').innerHTML='';clearGraph()}catch(e){msg(e.message,1)}};
 
@@ -89,8 +89,8 @@ $('#open').onclick=async()=>{msg('opening…');try{await api('/api/repo',{path:$
 async function loadReqs(){const r=await api(`/api/requirements?q=${encodeURIComponent($('#q').value)}&status=${$('#st').value}`);
  $('#noreq').style.display=r.requirements.length||$('#q').value||$('#st').value?'none':'block';
  const cc={tested:'ok','untested':'warn','no-code':'bad'};
- $('#reqs').innerHTML=r.requirements.map(x=>`<tr class="row" data-req="${esc(x.id)}"><td><b>${esc(x.id)}</b></td><td>${esc(x.title)}${x.unmatched.length?`<div class="warn" style="font-size:12px">no code matches: ${esc(x.unmatched.join(', '))}</div>`:''}</td>
- <td><span class="b">${esc(x.status)}</span></td><td>${x.implementations}${x.inferred?` <span class="mut">(${x.inferred} inferred)</span>`:''}</td><td>${x.tests}${x.declared_tests?` <span class="mut">(${x.declared_tests} declared)</span>`:''}</td><td class="${cc[x.coverage]}">${x.coverage}</td></tr>`).join('')}
+ $('#reqs').innerHTML=r.requirements.map(x=>`<tr class="row" data-req="${esc(x.id)}"><td><b>${esc(x.id)}</b></td><td>${esc(x.title)}${x.unmatched.length?`<div class="warn" style="font-size:12px">no code matches: ${esc(x.unmatched.join(', '))}</div>`:''}${x.unexecuted&&x.unexecuted.length?`<div class="warn" style="font-size:12px">never executed in a test run: ${esc(x.unexecuted.slice(0,3).map(s=>s.split('::').pop()).join(', '))}${x.unexecuted.length>3?' +'+(x.unexecuted.length-3):''}</div>`:''}</td>
+ <td><span class="b">${esc(x.status)}</span></td><td>${x.implementations}${x.inferred?` <span class="mut">(${x.inferred} inferred)</span>`:''}</td><td>${x.tests}${x.runtime_tests?` <span class="ok" title="executed the code in a measured test run">(${x.runtime_tests} ran it)</span>`:''}${x.declared_tests?` <span class="mut">(${x.declared_tests} declared)</span>`:''}</td><td class="${cc[x.coverage]}">${x.coverage}</td></tr>`).join('')}
 $('#reqs').onclick=e=>{const r=e.target.closest('[data-req]');if(r)openTrace(r.dataset.req)};
 $('#q').oninput=loadReqs;$('#st').onchange=loadReqs;
 
@@ -127,7 +127,8 @@ $('#found').onclick=e=>{const a=e.target.closest('[data-add]');if(a){picked.add(
 $('#go').onclick=async()=>{$('#res').innerHTML='analyzing…';try{const r=await api('/api/impact',{targets:[...picked],use_diff:useDiff,base:$('#base').value,depth:+$('#depth').value});showImpact(r.result);drawGraph(r.graph)}catch(e){$('#res').innerHTML=`<p class="bad">${esc(e.message)}</p>`;clearGraph()}};
 function showImpact(r){const cmd=r.tests.length?'pytest '+r.tests.map(t=>t.pytest_id).join(' '):'';
  $('#res').innerHTML=`<div class="card"><b>${r.changed.length}</b> changed → <b>${r.impacted.length}</b> affected · <b>${r.tests.length}</b> tests · <b>${r.requirements.length}</b> requirements</div>
- ${cmd?`<h3>Tests to run</h3><pre id="cmd">${esc(cmd)}</pre><button onclick="navigator.clipboard.writeText($('#cmd').textContent)">Copy</button>`:''}
+ ${cmd?`<h3>Tests to run</h3><pre id="cmd">${esc(cmd)}</pre><button onclick="navigator.clipboard.writeText($('#cmd').textContent)">Copy</button>
+ <div class="mut" style="font-size:12px;margin-top:6px">${r.tests.map(t=>`${esc(t.pytest_id.split('::').slice(1).join('::'))}: <b>${esc(t.evidence.join('+'))}</b>${t.line_check=='miss'?' (ran the function, not the changed lines)':''}`).join(' · ')}${r.runtime&&!r.runtime.available?' · no runtime coverage imported (tracegraph coverage run)':''}</div>`:''}
  ${r.requirements.length?'<h3>Requirements affected</h3>'+r.requirements.map(q=>`<div><a class="s" onclick="openTrace('${esc(q.id)}')">${esc(q.id)}</a> ${esc(q.title)} <span class="mut">distance ${q.distance}</span>${q.inferred?` <span class="b warn" title="LLM-proposed link">inferred ${q.confidence.toFixed(2)}</span>`:''}</div>`).join(''):''}
  <h3>Potentially affected</h3><table><thead><tr><th>d</th><th>symbol</th><th>conf</th></tr></thead><tbody>${r.impacted.map(i=>`<tr><td>${i.distance}</td><td>${sym(i.id)}<div class="mut" style="font-size:12px">${i.kind}${i.call_line?' · call at L'+i.call_line:''}</div></td><td class="${i.provenance=='static'?'':'warn'}">${i.confidence.toFixed(2)}${i.provenance=='static'?'':' ~'}</td></tr>`).join('')||'<tr><td colspan=3 class="mut">nothing depends on the changed code</td></tr>'}</tbody></table>`}
 function clearGraph(){if(cy){cy.destroy();cy=null}$('#legend').textContent=''}
@@ -155,5 +156,6 @@ async function pollJob(){try{const j=await api('/api/llm/job');if(j.state=='idle
  if(j.state=='running')return setTimeout(pollJob,1000);
  if(j.state=='done'){await status();loadReqs();const r=j.result;if(j.task=='draft'){$('#draftbox').innerHTML=`<div class="card"><b>Draft requirements</b> (${r.count}) saved to <code>${esc(r.path)}</code>. Review it, save as requirements.yaml, then press Index.<pre>${esc(r.yaml)}</pre></div>`;tab('a')}else lm(`${j.task} done: ${JSON.stringify(r)}`)}}catch(e){lm(e.message,1)}}
 $('#ltest').onclick=()=>runLLM('test');$('#lsum').onclick=()=>runLLM('summarize',{limit:100});$('#llink').onclick=()=>runLLM('link');$('#ldraft').onclick=()=>runLLM('draft');
+$('#resolve').onclick=async()=>{try{await api('/api/resolve',{});pollJob()}catch(e){msg(e.message,1)}};
 status().then(loadReqs);llmCfg();pollJob();
 </script></body></html>

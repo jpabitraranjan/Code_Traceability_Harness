@@ -66,3 +66,15 @@ def test_incremental_index_skips_unchanged(repo):
     assert index_repo(repo, repo / ".tg.db")["reparsed"] == 0
     (repo / "pkg/calc.py").write_text(FILES["pkg/calc.py"] + "\n# touched\n")
     assert index_repo(repo, repo / ".tg.db")["reparsed"] == 1
+
+
+def test_tracegraphignore_excludes_nested_projects_and_patterns(tmp_path):
+    for p, c in {"keep.py": "def a():\n    pass\n", "other/proj/x.py": "def b():\n    pass\n",
+                 "vendor/v.py": "def c():\n    pass\n", "gen_pb2.py": "def d():\n    pass\n",
+                 ".tracegraphignore": "# nested sample project\nother/proj/\nvendor/\n*_pb2.py\n"}.items():
+        f = tmp_path / p
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(c)
+    index_repo(tmp_path, tmp_path / "g.db")
+    paths = {r["path"] for r in connect(tmp_path / "g.db").execute("SELECT path FROM files")}
+    assert paths == {"keep.py"}

@@ -100,7 +100,7 @@ class Workspace:
         imp_ = [{"id": i["id"], "distance": i["distance"], "confidence": i["confidence"],
                  "calls_at_line": i["call_line"], **({"heuristic": True} if i["provenance"] != "static" else {})}
                 for i in res["impacted"]]
-        tests = [t["pytest_id"] for t in res["tests"]]
+        tests = [t["pytest_id"] for t in res["tests"]]  # ordered: ran the changed lines > ran the function > static
         out = {"changed": [{"id": c["id"], "lines": f"{c['start']}-{c['end']}",
                             **({"changed_lines": c["changed_lines"][:10]} if c["changed_lines"] else {}),
                             **({"diagnostics": c["diagnostics"]} if c["diagnostics"] else {})} for c in res["changed"]],
@@ -111,6 +111,12 @@ class Workspace:
                                  "declared_tests": r["declared_tests"],
                                  **({"inferred_link": True, "confidence": r["confidence"]} if r.get("inferred") else {})}
                                 for r in res["requirements"]]}
+        executed = [t["pytest_id"] for t in res["tests"] if any(e.startswith("runtime") for e in t["evidence"])
+                    and t.get("line_check") != "miss"]
+        if executed:
+            out["tests_that_executed_changed_code"] = executed  # measured, not inferred: run these first
+        out["runtime_coverage"] = ("available" if res["runtime"]["available"] else
+                                   "not imported: run `tracegraph coverage run` to see which tests really execute this code")
         if tests:
             out["run_command"] = "pytest " + " ".join(tests)
         out["note"] = ("confidence<0.9 / heuristic edges come from name matching without type inference; "
@@ -135,12 +141,12 @@ class Workspace:
     def impact_of_diff(self, base: str = "HEAD", depth: int = 6, min_confidence: float = 0.0) -> dict:
         c = self.conn()
         try:
-            seeds = imp.seeds_from_diff(c, self.repo, base)
+            res = imp.impact_for_diff(c, self.repo, base, depth, min_confidence)
         except Exception as e:
             return {"error": f"git diff failed: {e}"}
-        if not seeds:
+        if res is None:
             return {"changed": [], "note": f"no changed Python symbols vs {base}"}
-        return self._with_summaries(c, self._compact(imp.impact(c, seeds, depth, min_confidence)))
+        return self._with_summaries(c, self._compact(res))
 
     def impact_of_symbols(self, targets: list[str], depth: int = 6, min_confidence: float = 0.0) -> dict:
         c = self.conn()
